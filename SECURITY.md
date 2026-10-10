@@ -4,8 +4,9 @@ Porchly puts people's data on a network, so security reports are very welcome.
 
 **Please don't open a public issue for a vulnerability.** Report it privately through
 [GitHub's security advisories](https://github.com/YasserManss/porchly/security/advisories/new)
-for this repository. Include what you found, how to reproduce it, and what an attacker could do.
-You'll get an answer within a week.
+for this repository, or by email to [jiss.saudi@gmail.com](mailto:jiss.saudi@gmail.com).
+Include what you found, how to reproduce it, and what an attacker could do. You'll get an answer
+within a week.
 
 ## What's in scope
 - The API: authentication, keys, read-only keys, the read-only public link, rate and size limits.

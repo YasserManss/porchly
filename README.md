@@ -101,6 +101,8 @@ Porchly is portable. Your tables live in one file in a **Porchly data** folder n
 
 **Is it ready for my business?** Not yet. Porchly is young (version 0.1). Keep your own copies of anything important. See the [roadmap](ROADMAP.md).
 
+**How do I get in touch?** For a bug or an idea, open a [GitHub issue](https://github.com/YasserManss/porchly/issues). For anything else, write to [jiss.saudi@gmail.com](mailto:jiss.saudi@gmail.com).
+
 ## For developers
 Building from source, running the tests and how the code is organised: [CONTRIBUTING.md](CONTRIBUTING.md). Reference documentation:
 [API](docs/api.md) · [Functions](docs/functions.md) · [Porch light](docs/porch-light.md) · [Settings](docs/settings.md) · [Command line](docs/cli.md) · [Remote control](docs/control-protocol.md)
