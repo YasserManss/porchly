@@ -1,0 +1,13 @@
+[package]
+name = "xtask"
+description = "Porchly project tasks: ci, layers, assets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

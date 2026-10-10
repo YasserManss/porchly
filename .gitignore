@@ -1,0 +1,6 @@
+/target/
+/plan/
+*.db
+*.db-wal
+*.db-shm
+/release/

@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 1040 280">
+  <!-- Porchly logo (light backgrounds): the lantern icon and the name, set in Noto Sans Bold. -->
+  <image href="porchly-icon.svg" x="0" y="0" width="280" height="280"/>
+  <text x="318" y="190" font-family="Noto Sans" font-weight="700" font-size="172" letter-spacing="-3" fill="#24211E">Porchly</text>
+</svg>

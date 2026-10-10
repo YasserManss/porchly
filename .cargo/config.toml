@@ -1,0 +1,10 @@
+# Windows: link the C runtime into the program, so porchly.exe runs on any Windows without
+# installing anything else (portable, no installer).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[alias]
+xtask = "run --quiet --package xtask --"

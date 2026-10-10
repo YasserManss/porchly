@@ -1,0 +1,28 @@
+[package]
+name = "porchly-ui-egui"
+description = "Porchly's desktop interface (egui). Swappable: nothing below it depends on it."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+porchly-core.workspace = true
+porchly-engine.workspace = true
+egui.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+rfd.workspace = true
+getrandom.workspace = true
+data-encoding.workspace = true
+image.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+porchly-store.workspace = true
+serde_json.workspace = true
+egui_kittest = { workspace = true, features = ["wgpu", "snapshot"] }
+
+[lints]
+workspace = true

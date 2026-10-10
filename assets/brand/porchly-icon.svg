@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- Porchly app icon: a porch lantern glowing at night. Original artwork, CC0. -->
+  <defs>
+    <radialGradient id="glow" cx="50%" cy="50%" r="50%">
+      <stop offset="0" stop-color="#F2A73B" stop-opacity="0.6"/>
+      <stop offset="0.55" stop-color="#F2A73B" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#F2A73B" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="flame" cx="50%" cy="45%" r="50%">
+      <stop offset="0" stop-color="#FFF6DD"/>
+      <stop offset="0.5" stop-color="#FFD27A"/>
+      <stop offset="1" stop-color="#F2A73B"/>
+    </radialGradient>
+    <linearGradient id="night" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2E2924"/>
+      <stop offset="1" stop-color="#1A1714"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#night)"/>
+  <circle cx="256" cy="262" r="210" fill="url(#glow)"/>
+  <!-- hanger -->
+  <circle cx="256" cy="116" r="17" fill="none" stroke="#F2A73B" stroke-width="12"/>
+  <rect x="249" y="130" width="14" height="28" rx="4" fill="#F2A73B"/>
+  <!-- cap -->
+  <path d="M176 178 L256 146 L336 178 Z" fill="#F2A73B" stroke="#F2A73B" stroke-width="14" stroke-linejoin="round"/>
+  <!-- glass -->
+  <path d="M190 186 L208 340 L304 340 L322 186 Z" fill="#4A3820" stroke="#F2A73B" stroke-width="16" stroke-linejoin="round"/>
+  <path d="M256 190 L256 336" stroke="#F2A73B" stroke-width="8" opacity="0.55"/>
+  <!-- light -->
+  <ellipse cx="256" cy="262" rx="40" ry="50" fill="url(#flame)"/>
+  <!-- base -->
+  <rect x="182" y="344" width="148" height="26" rx="9" fill="#F2A73B"/>
+  <rect x="214" y="370" width="84" height="16" rx="6" fill="#B06507"/>
+</svg>

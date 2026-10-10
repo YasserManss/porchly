@@ -1,0 +1,23 @@
+[package]
+name = "porchly-cli"
+description = "Porchly from the terminal: serve a project, run commands"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "porchly-cli"
+path = "src/main.rs"
+
+[dependencies]
+porchly-store.workspace = true
+porchly-api.workspace = true
+porchly-engine.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

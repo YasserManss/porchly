@@ -1,0 +1,19 @@
+[package]
+name = "porchly-fetch"
+description = "Downloads helper programs (Bun, cloudflared) and checks them against pinned checksums"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+porchly-core.workspace = true
+sha2.workspace = true
+data-encoding.workspace = true
+ureq.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

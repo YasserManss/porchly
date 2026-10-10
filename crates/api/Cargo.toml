@@ -1,0 +1,26 @@
+[package]
+name = "porchly-api"
+description = "Porchly HTTP API generated from the project's tables"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+porchly-core.workspace = true
+porchly-schema.workspace = true
+porchly-store.workspace = true
+axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+form_urlencoded.workspace = true
+tracing.workspace = true
+http-body-util.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tower.workspace = true
+
+[lints]
+workspace = true

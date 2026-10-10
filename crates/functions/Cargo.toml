@@ -1,0 +1,29 @@
+[package]
+name = "porchly-functions"
+description = "Porchly functions: JavaScript behind API routes, run with Bun, one process per call"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+porchly-core.workspace = true
+porchly-api.workspace = true
+axum.workspace = true
+tokio.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+porchly-fetch.workspace = true
+tracing.workspace = true
+ureq.workspace = true
+zip.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

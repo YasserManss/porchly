@@ -1,0 +1,21 @@
+[package]
+name = "porchly-tunnel"
+description = "The porch light: a public link to the API through a Cloudflare quick tunnel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+porchly-core.workspace = true
+porchly-fetch.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tar.workspace = true
+flate2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

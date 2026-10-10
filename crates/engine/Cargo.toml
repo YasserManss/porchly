@@ -1,0 +1,28 @@
+[package]
+name = "porchly-engine"
+description = "Porchly command engine: every user-visible action is a command"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+porchly-core.workspace = true
+porchly-schema.workspace = true
+porchly-store.workspace = true
+porchly-api.workspace = true
+porchly-functions.workspace = true
+porchly-tunnel.workspace = true
+getrandom.workspace = true
+data-encoding.workspace = true
+tokio.workspace = true
+csv.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+ureq.workspace = true
+
+[lints]
+workspace = true

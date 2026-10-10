@@ -1,0 +1,15 @@
+[package]
+name = "porchly-schema"
+description = "Porchly table and field definitions, and validation of row values"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+porchly-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
