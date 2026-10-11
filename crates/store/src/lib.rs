@@ -4,6 +4,7 @@
 //! Values are always bound as parameters. Identifiers can't be bound, so they are only ever
 //! spliced in as [`Ident::quoted`], which is safe because [`Ident`] is validated.
 
+mod backup;
 mod convert;
 mod filter;
 mod keys;
@@ -11,6 +12,7 @@ mod migrate;
 mod rows;
 mod snapshot;
 mod tables;
+mod undo;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -18,12 +20,14 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use porchly_core::{Error, Result};
 use rusqlite::{Connection, OptionalExtension};
 
+pub use backup::{RestorePoint, Restored};
 pub use filter::{ColumnRef, Filter, Op, Related};
 pub use keys::KeyInfo;
 pub use migrate::FORMAT_VERSION;
 pub use rows::{ListQuery, Page, Row, parse_expand};
 pub use snapshot::SnapshotInfo;
 pub use tables::FieldChange;
+pub use undo::{UndoInfo, Undone};
 
 /// SQL expression for "now" as an RFC 3339 UTC timestamp with milliseconds.
 const NOW: &str = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";

@@ -9,6 +9,7 @@ effect at once.
 | Stop a function that hasn't answered after | 10 s, 30 s, 1 min, 5 min, no limit (shown when Functions are on) | No limit | `function_timeout`: `10`, `30`, `60`, `300`, `0` |
 | Port | 1024 to 65535 | 11911 | `port` (a running API moves to it at once) |
 | Turn on the API when Porchly opens | on / off | on | `start_api` |
+| Let AI assistants make new tables and fields | on / off | off | `ai_can_make_tables` (see [mcp.md](mcp.md)) |
 
 The request limit counts per key and is always on: apps that ask faster get `429 rate_limited`
 and should slow down. Functions' own key isn't limited.

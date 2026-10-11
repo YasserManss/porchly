@@ -19,9 +19,12 @@ Create keys with the `api.key.create` command. A key is shown once, when it is c
 | `GET` | `/api/openapi.json` | read | OpenAPI 3.1 description of this project |
 | `GET` | `/api/{table}` | read | A page of rows (below) |
 | `GET` | `/api/{table}/{id}` | read | One row |
-| `POST` | `/api/{table}` | write | Creates a row; `201` with the row |
+| `POST` | `/api/{table}` | write | Creates a row; `201` with the row. A list creates [several](#many-rows-at-once) |
 | `PATCH` | `/api/{table}/{id}` | write | Changes the fields sent; returns the row |
 | `DELETE` | `/api/{table}/{id}` | write | `204`, no body |
+| `PATCH` | `/api/{table}?conditions` | write | Changes [every matching row](#many-rows-at-once); `{"updated": n}` |
+| `DELETE` | `/api/{table}?conditions` | write | Deletes [every matching row](#many-rows-at-once); `{"deleted": n}` |
+| `POST` | `/mcp` | read or write | For AI assistants (MCP); see [mcp.md](mcp.md) |
 | any | `/api/fn/{name}/…` | read, or none | Runs a function (when Functions are on); see [functions.md](functions.md) |
 
 No table can be called `fn`: that address belongs to functions.
@@ -82,6 +85,31 @@ Notes:
 - Values are checked against the field type: `?minutes=lt.soon` is a `400` error.
 - The `row.list` command takes the same conditions as `"where": {"minutes": "lt.30"}`; `null` means `is.empty`.
 
+## Many rows at once
+**Add several rows** by sending a list (at most 1,000 rows and 1 MB). It's all or nothing: if any row is refused, none are added, and the error names the row.
+
+```sh
+curl -X POST -H "Authorization: Bearer pk_..." \
+  -d '[{"name":"Soup","minutes":30},{"name":"Salad","minutes":10}]' localhost:11911/api/recipes
+# 201  {"count": 2, "items": [{"id": 7, ...}, {"id": 8, ...}]}
+# 400  {"error": {"code": "invalid", "message": "Row 2: \"name\" is required."}}
+```
+
+**Change or delete many rows** by putting [conditions](#conditions) in the address, the same ones a list takes (including `search` and fields of linked tables). Every matching row is affected, in one step.
+
+```sh
+curl -X PATCH  -H "Authorization: Bearer pk_..." -d '{"delivered":true}' 'localhost:11911/api/orders?id=in.1,2,3'
+# {"updated": 3}
+curl -X DELETE -H "Authorization: Bearer pk_..." 'localhost:11911/api/orders?delivered=true&customer.city=Paris'
+# {"deleted": 2}
+```
+
+- **A condition is required.** `PATCH` or `DELETE` on `/api/{table}` with no condition is refused (`400`), so a forgotten filter never touches a whole table. To really mean every row, say so: `?id=gte.1`.
+- `limit`, `offset`, `sort` and `expand` are refused here, because every matching row is affected, not a page of them.
+- Matching nothing isn't an error: you get `{"updated": 0}` or `{"deleted": 0}`.
+- Deleting rows clears links to them from other tables, as deleting one row does.
+- All of these need a key that may make changes, and are refused through a read-only public link.
+
 ## Links between tables
 A `link` field points to one row of another table: an order's `customer` holds the `id` of a row in `customers`. Make one with `field.add` (`"type": "link", "links_to": "customers"`) or in the app (Add field → Link to another table).
 
@@ -115,7 +143,7 @@ Errors are JSON with a stable `code` and a message written for people:
 | 404 | `not_found` | No such table or row |
 | 405 | `method_not_allowed` | The route doesn't accept that method |
 | 409 | `conflict` | Something with that name already exists, or a table other tables link to was deleted |
-| 413 | `too_large` | Body over 1 MB, query string over 8 KB, more than 32 conditions, or more than 100 values in `in` |
+| 413 | `too_large` | Body over 1 MB, query string over 8 KB, more than 32 conditions, more than 100 values in `in`, or more than 1,000 rows in one list |
 | 429 | `rate_limited` | More requests with one key than Settings allow: 20 a second by default (1 to 1000), with bursts of 3 seconds' worth |
 | 500 | `internal` / `storage` | A problem inside Porchly; details go to the server log, not the response |
 

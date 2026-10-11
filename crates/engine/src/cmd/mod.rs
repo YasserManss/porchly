@@ -1,5 +1,6 @@
 //! The command registry. Adding a user-visible feature means adding a command here, with tests.
 
+mod backup;
 mod csv;
 mod function;
 mod key;
@@ -8,6 +9,7 @@ mod row;
 mod sample;
 mod server;
 mod settings;
+mod stats;
 mod table;
 mod tunnel;
 
@@ -47,9 +49,11 @@ static REGISTRY: std::sync::LazyLock<Vec<Command>> = std::sync::LazyLock::new(||
     all.extend(row::commands());
     all.extend(key::commands());
     all.extend(csv::commands());
+    all.extend(backup::commands());
     all.extend(server::commands());
     all.extend(tunnel::commands());
     all.extend(settings::commands());
+    all.extend(stats::commands());
     all.extend(function::commands());
     all.extend(sample::commands());
     all

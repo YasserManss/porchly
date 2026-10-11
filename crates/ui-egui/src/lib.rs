@@ -11,6 +11,7 @@ pub mod names;
 mod porch_light;
 mod share;
 mod sidebar;
+mod stats_view;
 pub mod theme;
 
 use std::collections::HashMap;
@@ -19,7 +20,7 @@ use egui::{RichText, Ui};
 use porchly_engine::Engine;
 use serde_json::{Value, json};
 
-pub use dialogs::{Dialog, ImportColumn};
+pub use dialogs::{BackupAction, ChangeItem, Dialog, ImportColumn, PointItem};
 use function_view::{Enabling, FnEditor};
 use icons::Icon;
 use model::{FnItem, KeyInfo, ServerStatus, TableInfo};
@@ -49,6 +50,12 @@ pub(crate) fn row_label(row: &Value, label_field: Option<&str>, id: i64) -> Stri
         .map_or_else(|| format!("Row {id}"), str::to_owned)
 }
 
+/// How often the open Stats window re-reads its numbers, in seconds.
+const STATS_EVERY: f64 = 1.0;
+
+/// How often the app checks that today's backup exists, in seconds.
+const BACKUP_CHECK_EVERY: f64 = 600.0;
+
 /// How often the API status is re-read while the app is open, in seconds.
 const STATUS_EVERY: f64 = 2.0;
 
@@ -73,6 +80,8 @@ pub struct PorchlyApp {
     pub(crate) link_options: HashMap<String, LinkChoices>,
     /// What was typed in each link dropdown's search box, by linked table.
     pub(crate) link_queries: HashMap<String, String>,
+    /// Rows ticked in the grid, by id (for "Delete selected").
+    pub(crate) picked_rows: std::collections::BTreeSet<i64>,
     /// The grid's search text.
     pub(crate) search: String,
     /// The first row shown (paging).
@@ -88,6 +97,12 @@ pub struct PorchlyApp {
     /// A key just created: shown once, until the person closes it.
     pub(crate) fresh_key: Option<(String, String)>,
     last_status: f64,
+    /// When the app last made sure today's backup exists.
+    last_backup_check: f64,
+    /// When the Stats window's numbers were last read.
+    last_stats: f64,
+    /// The Stats window shows numbers given to it, not live ones (screenshots).
+    stats_frozen: bool,
     control: Option<control::Control>,
     /// Screenshots asked for over the control channel, waiting for the next frame.
     pending_shots: Vec<PendingShot>,
@@ -109,6 +124,8 @@ pub(crate) struct Notice {
     pub text: String,
     pub error: bool,
     pub until: f64,
+    /// Offers "Undo" for the change just made.
+    pub undo: bool,
 }
 
 impl PorchlyApp {
@@ -127,6 +144,7 @@ impl PorchlyApp {
             new_row_link_labels: HashMap::new(),
             link_options: HashMap::new(),
             link_queries: HashMap::new(),
+            picked_rows: std::collections::BTreeSet::new(),
             search: String::new(),
             offset: 0,
             server: ServerStatus::default(),
@@ -137,6 +155,9 @@ impl PorchlyApp {
             notice: None,
             fresh_key: None,
             last_status: f64::NEG_INFINITY,
+            last_backup_check: 0.0,
+            last_stats: 0.0,
+            stats_frozen: false,
             control: None,
             pending_shots: Vec::new(),
             next_shot: 0,
@@ -180,12 +201,19 @@ impl PorchlyApp {
             self.link_queries.clear();
         }
         self.selected = Some(name.to_owned());
+        self.picked_rows.clear();
         self.open_function = None;
         self.edits.clear();
         self.new_row.clear();
         self.new_row_flags.clear();
         self.new_row_link_labels.clear();
         self.reload_rows();
+    }
+
+    /// Ticks rows of the open table, as if their checkboxes were clicked (screenshots).
+    pub fn pick_rows(&mut self, ids: &[i64]) {
+        let shown: Vec<i64> = self.rows.iter().filter_map(|r| r.get("id").and_then(Value::as_i64)).collect();
+        self.picked_rows = ids.iter().copied().filter(|id| shown.contains(id)).collect();
     }
 
     /// Opens a dialog (also used by tests and screenshots).
@@ -356,6 +384,46 @@ impl PorchlyApp {
         self.reload_keys();
     }
 
+    /// Opens "Connect an AI assistant": what to paste into the assistant, for this project.
+    pub fn open_connect_ai(&mut self) {
+        // The public link when the porch light is on, otherwise this computer's address.
+        let base = match (&self.light.url, self.light.is_on(), self.server.url.is_empty()) {
+            (Some(url), true, _) => url.clone(),
+            (_, _, false) => self.server.url.clone(),
+            _ => "http://127.0.0.1:11911".to_owned(),
+        };
+        let url = format!("{base}/mcp");
+        let project = self
+            .engine
+            .execute("project.info", &Value::Null)
+            .ok()
+            .and_then(|i| i.get("path").and_then(Value::as_str).map(str::to_owned))
+            .unwrap_or_else(|| "porchly.db".to_owned());
+        // porchly-cli ships next to the app.
+        let cli = std::env::current_exe()
+            .ok()
+            .and_then(|exe| Some(exe.parent()?.join(if cfg!(windows) { "porchly-cli.exe" } else { "porchly-cli" })))
+            .filter(|p| p.is_file())
+            .map_or_else(|| "porchly-cli".to_owned(), |p| p.display().to_string());
+        let pretty = |v: Value| serde_json::to_string_pretty(&v).unwrap_or_default();
+        let snippets = vec![
+            (
+                "Claude Code (run this in a terminal)".to_owned(),
+                format!("claude mcp add --transport http porchly {url} --header \"Authorization: Bearer YOUR_KEY\""),
+            ),
+            (
+                "Cursor, VS Code and others that connect to an address".to_owned(),
+                pretty(json!({"mcpServers": {"porchly": {
+                    "type": "http", "url": url, "headers": {"Authorization": "Bearer YOUR_KEY"}}}})),
+            ),
+            (
+                "Claude Desktop and others that start a program".to_owned(),
+                pretty(json!({"mcpServers": {"porchly": {"command": cli, "args": ["mcp", "--project", project]}}})),
+            ),
+        ];
+        self.open_dialog(Dialog::ConnectAi { snippets, copied: None });
+    }
+
     /// Opens the Settings dialog with the current settings.
     pub fn open_settings(&mut self) {
         if let Some(current) = self.run("settings.get", json!({})) {
@@ -412,6 +480,10 @@ impl PorchlyApp {
                 .and_then(Value::as_array)
                 .map(|items| items.iter().filter_map(|r| r.as_object().cloned()).collect())
                 .unwrap_or_default();
+            // Only rows on screen can be ticked: nothing out of sight is ever deleted.
+            let shown: std::collections::BTreeSet<i64> =
+                self.rows.iter().filter_map(|r| r.get("id").and_then(Value::as_i64)).collect();
+            self.picked_rows.retain(|id| shown.contains(id));
             // Past the end (rows were deleted elsewhere): go back to the last page.
             if self.rows.is_empty() && self.offset > 0 && self.total_rows > 0 {
                 self.offset = (self.total_rows - 1) / u64::from(PAGE_SIZE) * u64::from(PAGE_SIZE);
@@ -500,13 +572,67 @@ impl PorchlyApp {
     }
 
     pub(crate) fn info(&mut self, text: impl Into<String>) {
-        self.notice = Some(Notice { text: text.into(), error: false, until: 0.0 });
+        self.notice = Some(Notice { text: text.into(), error: false, until: 0.0, undo: false });
+    }
+
+    /// A notice with an Undo button, for a change that was just made to rows.
+    pub(crate) fn info_with_undo(&mut self, text: impl Into<String>) {
+        self.notice = Some(Notice { text: text.into(), error: false, until: 0.0, undo: true });
+    }
+
+    /// Undoes the newest change (or the change `id`) and shows what came back.
+    pub fn undo(&mut self, id: Option<i64>) {
+        if let Some(done) = self.run("undo.run", json!({"id": id})) {
+            let what = done.get("summary").and_then(Value::as_str).unwrap_or("the change").to_owned();
+            self.reload_tables();
+            self.info(format!("Undone: {}.", lower_first(&what)));
+        }
+    }
+
+    /// Opens the Stats window. It refreshes itself while open.
+    pub fn open_stats(&mut self) {
+        if let Some(data) = self.run("stats.get", json!({})) {
+            self.open_dialog(Dialog::Stats { data });
+        }
+    }
+
+    /// Shows the Stats window with these numbers and leaves them alone (screenshots).
+    pub fn show_stats(&mut self, data: Value) {
+        self.stats_frozen = true;
+        self.open_dialog(Dialog::Stats { data });
+    }
+
+    /// Keeps the Stats window's numbers current.
+    fn refresh_stats(&mut self, ctx: &egui::Context, now: f64) {
+        if !matches!(self.dialog, Some(Dialog::Stats { .. })) {
+            self.stats_frozen = false;
+            return;
+        }
+        if self.stats_frozen {
+            return;
+        }
+        if now - self.last_stats >= STATS_EVERY {
+            self.last_stats = now;
+            if let (Ok(fresh), Some(Dialog::Stats { data })) =
+                (self.engine.execute("stats.get", &Value::Null), &mut self.dialog)
+            {
+                *data = fresh;
+            }
+        }
+        ctx.request_repaint_after(std::time::Duration::from_secs_f64(STATS_EVERY));
+    }
+
+    /// Opens the Backups window: recent changes to undo, and backups to restore.
+    pub fn open_backups(&mut self) {
+        let changes = self.run("undo.list", json!({"limit": 30})).unwrap_or_default();
+        let points = self.run("backup.list", json!({})).unwrap_or_default();
+        self.open_dialog(Dialog::backups(&changes, &points));
     }
 
     pub(crate) fn error(&mut self, text: impl Into<String>) {
         let text = text.into();
         tracing::warn!("{text}");
-        self.notice = Some(Notice { text, error: true, until: 0.0 });
+        self.notice = Some(Notice { text, error: true, until: 0.0, undo: false });
     }
 
     /// Draws the whole window.
@@ -527,9 +653,17 @@ impl PorchlyApp {
             }
         }
         ctx.request_repaint_after(std::time::Duration::from_secs_f64(STATUS_EVERY));
+        // The app may stay open for days: make sure each day gets its backup.
+        if now - self.last_backup_check > BACKUP_CHECK_EVERY {
+            self.last_backup_check = now;
+            if let Err(e) = self.engine.execute("backup.daily", &Value::Null) {
+                tracing::warn!("couldn't make today's backup: {e}");
+            }
+        }
 
         self.handle_control(&ctx);
         self.poll_function_jobs(&ctx);
+        self.refresh_stats(&ctx, now);
         self.poll_light(&ctx);
         let t = Tokens::get(&ctx);
         self.top_bar(ui, &t);
@@ -569,6 +703,20 @@ impl PorchlyApp {
                             self.open_settings();
                         }
                         ui.add_space(8.0);
+                        if icons::button(ui, Some(Icon::Stats), "Stats", false)
+                            .on_hover_text("How much your tables are used, and how big they are")
+                            .clicked()
+                        {
+                            self.open_stats();
+                        }
+                        ui.add_space(8.0);
+                        if icons::button(ui, Some(Icon::History), "Backups", false)
+                            .on_hover_text("Undo recent changes, or go back to a backup")
+                            .clicked()
+                        {
+                            self.open_backups();
+                        }
+                        ui.add_space(8.0);
                         let label = if self.show_share { "Close sharing" } else { "Share" };
                         if icons::button(ui, Some(Icon::Share), label, !self.show_share).clicked() {
                             self.show_share = !self.show_share;
@@ -590,22 +738,41 @@ impl PorchlyApp {
     }
 
     fn notice_bar(&mut self, ui: &mut Ui, t: &Tokens, now: f64) {
-        let Some(notice) = &mut self.notice else { return };
-        if notice.until == 0.0 {
-            notice.until = now + if notice.error { 12.0 } else { 4.0 };
+        if let Some(notice) = &mut self.notice {
+            if notice.until == 0.0 {
+                // Longer when there's something to decide.
+                notice.until = now + if notice.error || notice.undo { 12.0 } else { 4.0 };
+            }
+            if now > notice.until {
+                self.notice = None;
+            }
         }
-        if now > notice.until {
-            self.notice = None;
+        let Some(notice) = &self.notice else {
+            // The bar's place is kept (at no height) when there's nothing to say. Widgets
+            // get their ids from what was drawn before them, so a bar that came and went
+            // would change the id of everything after it: a click made at that moment would
+            // be lost, and a box being typed in would lose the cursor.
+            egui::Panel::bottom("notice")
+                .exact_size(0.0)
+                .frame(egui::Frame::NONE)
+                .show_separator_line(false)
+                .show(ui, |_| {});
             return;
-        }
+        };
         let (fg, bg) = if notice.error { (t.danger, t.danger_soft) } else { (t.ok, t.ok_soft) };
         let text = notice.text.clone();
+        let offer_undo = notice.undo;
+        let mut undo = false;
         let mut close = false;
         egui::Panel::bottom("notice")
+            .show_separator_line(false)
             .frame(egui::Frame::NONE.fill(bg).inner_margin(egui::Margin::symmetric(16, 10)))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(text).color(fg));
+                    if offer_undo {
+                        undo = icons::button(ui, None, "Undo", false).clicked();
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         close = icons::icon_button(ui, Icon::Close, "Dismiss").clicked();
                     });
@@ -614,6 +781,18 @@ impl PorchlyApp {
         if close {
             self.notice = None;
         }
+        if undo {
+            self.undo(None);
+        }
+    }
+}
+
+/// "Deleted 3 rows" → "deleted 3 rows", for use inside a sentence.
+fn lower_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(first) => first.to_lowercase().chain(chars).collect(),
+        None => String::new(),
     }
 }
 

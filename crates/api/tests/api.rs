@@ -222,3 +222,38 @@ async fn joins_over_http() {
     );
     assert!(spec["components"]["schemas"]["recipes"]["properties"]["expand"]["properties"]["cook"].is_object());
 }
+
+#[tokio::test]
+async fn bulk_add_change_and_delete() {
+    let a = app();
+    let key = a.write_key.clone();
+    // Add several rows at once.
+    let (status, body) = a
+        .post("/api/recipes", r#"[{"name":"Soup","minutes":30},{"name":"Salad","minutes":10,"vegetarian":true},{"name":"Stew","minutes":90}]"#)
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["count"], 3);
+    assert_eq!((body["items"][0]["id"].as_i64(), body["items"][2]["name"].as_str()), (Some(1), Some("Stew")));
+
+    // One bad row: nothing is added, and the error says which row.
+    let (status, body) = a.post("/api/recipes", r#"[{"name":"Ok"},{"minutes":5}]"#).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"]["message"].as_str().unwrap().starts_with("Row 2:"), "{body}");
+    let (status, _) = a.post("/api/recipes", r#"[{"name":"Ok"}, 7]"#).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(a.row_count(), 3);
+
+    // Change every row matching a condition.
+    let (status, body) =
+        a.send(Method::PATCH, "/api/recipes?minutes=lt.60", Some(&key), Some(r#"{"vegetarian":true}"#)).await;
+    assert_eq!((status, body["updated"].as_u64()), (StatusCode::OK, Some(2)));
+    let (_, page) = a.get("/api/recipes?vegetarian=true").await;
+    assert_eq!(page["total"], 2);
+
+    // Delete by ids, then by a condition.
+    let (status, body) = a.send(Method::DELETE, "/api/recipes?id=in.1,3", Some(&key), None).await;
+    assert_eq!((status, body["deleted"].as_u64()), (StatusCode::OK, Some(2)));
+    let (_, body) = a.send(Method::DELETE, "/api/recipes?name=Nobody", Some(&key), None).await;
+    assert_eq!(body["deleted"], 0);
+    assert_eq!(a.row_count(), 1);
+}

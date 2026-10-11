@@ -34,6 +34,7 @@ Some tests need real helpers or the internet and are skipped unless you point th
 ```sh
 PORCHLY_TEST_BUN=/path/to/bun cargo test -p porchly-engine --test functions
 PORCHLY_TEST_CLOUDFLARED=/path/to/cloudflared cargo test -p porchly-engine --test porch_light
+PORCHLY_TEST_KEYCHAIN=1 cargo test -p porchly-secrets    # uses this computer's real keychain
 ```
 
 ## Looking at the app without a window
@@ -55,7 +56,7 @@ One Rust workspace; a crate may only use crates in its own or a lower layer
 | Layer | Crates | What |
 |---|---|---|
 | 0 | `core` | errors, validated names, field kinds, limits |
-| 1 | `schema`, `store`, `fetch` | values and tables; all SQL (SQLite); checked downloads |
+| 1 | `schema`, `store`, `fetch`, `secrets` | values and tables; all SQL (SQLite); checked downloads; the system keychain |
 | 2 | `api` | the HTTP API (axum) |
 | 3 | `functions`, `tunnel` | functions run with Bun; the porch light (cloudflared) |
 | 4 | `engine` | every action is a command: `Engine::execute(id, params)` |

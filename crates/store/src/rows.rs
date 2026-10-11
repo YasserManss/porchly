@@ -5,6 +5,7 @@ use rusqlite::{OptionalExtension, params_from_iter};
 use serde::Serialize;
 
 use crate::filter::{ColumnRef, Filter, Related, to_sql};
+use crate::undo;
 use crate::{DbResult, NOW, Store};
 
 /// A row as JSON: `id`, `created_at`, `updated_at`, then the user fields.
@@ -131,33 +132,8 @@ impl Store {
             return Err(Error::invalid("offset is too large."));
         }
         let related = self.related(&def)?;
-
-        // One LEFT JOIN per link followed by a filter or the sort.
-        let mut joins: Vec<&Ident> = Vec::new();
-        let used = q.filters.iter().map(|f| &f.column).chain(q.sort.as_ref().map(|(c, _)| c));
-        for link in used.filter_map(|c| c.link.as_ref()) {
-            if !joins.contains(&link) {
-                joins.push(link);
-            }
-        }
-        let alias_of = |c: &ColumnRef| match &c.link {
-            Some(link) => format!("j{}", joins.iter().position(|j| *j == link).unwrap_or(0)),
-            None => "t".to_owned(),
-        };
-        let mut from = format!("{} AS t", def.name.quoted());
-        for (i, link) in joins.iter().enumerate() {
-            let target = related
-                .get(link.as_str())
-                .ok_or_else(|| Error::invalid(format!("\"{link}\" isn't a link to another table.")))?;
-            from.push_str(&format!(" LEFT JOIN {} AS j{i} ON j{i}.\"id\" = t.{}", target.name.quoted(), link.quoted()));
-        }
-
-        let mut params: Vec<Value> = Vec::new();
-        let mut clauses: Vec<String> = q.filters.iter().map(|f| f.sql(&alias_of(&f.column), &mut params)).collect();
-        if let Some(text) = &q.search {
-            clauses.push(search_sql(&def, text, &mut params));
-        }
-        let where_sql = if clauses.is_empty() { String::new() } else { format!(" WHERE {}", clauses.join(" AND ")) };
+        let Selection { from, where_sql, mut params, joins } = selection(&def, &related, q, true)?;
+        let alias_of = |c: &ColumnRef| alias(&joins, c);
 
         let total: i64 = self
             .conn
@@ -314,12 +290,16 @@ impl Store {
         }
         params.push(Value::Integer(id));
         let tx = self.conn.transaction().db()?;
+        let summary = format!("Changed row {id} in {}", def.name);
+        let op = undo::begin(&tx, &summary)?;
+        undo::record(&tx, op, &def, false, "u.\"id\" = ?1", &[Value::Integer(id)])?;
         let changed = tx
             .execute(
                 &format!("UPDATE {} SET {} WHERE \"id\" = ?{}", def.name.quoted(), sets.join(", "), params.len()),
                 params_from_iter(params.iter()),
             )
             .db()?;
+        undo::finish(&tx, op, &summary)?;
         tx.commit().db()?;
         if changed == 0 {
             return Err(Error::not_found(format!("There's no row {id} in \"{}\".", def.name)));
@@ -332,11 +312,21 @@ impl Store {
     pub fn delete_row(&mut self, table: &str, id: i64) -> Result<()> {
         let def = self.table(table)?;
         let incoming = self.links_into(def.name.as_str())?;
+        let linking: Vec<(TableDef, Ident)> =
+            incoming.iter().map(|(t, f)| Ok((self.table(t.as_str())?, f.clone()))).collect::<Result<_>>()?;
         let tx = self.conn.transaction().db()?;
+        let summary = format!("Deleted row {id} from {}", def.name);
+        let op = undo::begin(&tx, &summary)?;
+        let me = [Value::Integer(id)];
+        undo::record(&tx, op, &def, true, "u.\"id\" = ?1", &me)?;
+        for (t, f) in &linking {
+            undo::record(&tx, op, t, false, &format!("u.{} = ?1", f.quoted()), &me)?;
+        }
         let changed = tx.execute(&format!("DELETE FROM {} WHERE \"id\" = ?1", def.name.quoted()), [id]).db()?;
         if changed == 0 {
             return Err(Error::not_found(format!("There's no row {id} in \"{}\".", def.name)));
         }
+        undo::finish(&tx, op, &summary)?;
         for (t, f) in &incoming {
             tx.execute(
                 &format!(
@@ -350,6 +340,182 @@ impl Store {
             .db()?;
         }
         tx.commit().db()
+    }
+}
+
+/// The rows a query picks: the FROM clause (with a LEFT JOIN per link used), the WHERE clause
+/// and its parameters.
+struct Selection {
+    from: String,
+    where_sql: String,
+    params: Vec<Value>,
+    joins: Vec<Ident>,
+}
+
+fn alias(joins: &[Ident], c: &ColumnRef) -> String {
+    match &c.link {
+        Some(link) => format!("j{}", joins.iter().position(|j| j == link).unwrap_or(0)),
+        None => "t".to_owned(),
+    }
+}
+
+/// Builds the selection for `q`. `with_sort` also joins the table the sort needs.
+fn selection(def: &TableDef, related: &Related, q: &ListQuery, with_sort: bool) -> Result<Selection> {
+    // One LEFT JOIN per link followed by a filter or the sort.
+    let mut joins: Vec<Ident> = Vec::new();
+    let sort = q.sort.as_ref().filter(|_| with_sort).map(|(c, _)| c);
+    for link in q.filters.iter().map(|f| &f.column).chain(sort).filter_map(|c| c.link.as_ref()) {
+        if !joins.contains(link) {
+            joins.push(link.clone());
+        }
+    }
+    let mut from = format!("{} AS t", def.name.quoted());
+    for (i, link) in joins.iter().enumerate() {
+        let target = related
+            .get(link.as_str())
+            .ok_or_else(|| Error::invalid(format!("\"{link}\" isn't a link to another table.")))?;
+        from.push_str(&format!(" LEFT JOIN {} AS j{i} ON j{i}.\"id\" = t.{}", target.name.quoted(), link.quoted()));
+    }
+    let mut params: Vec<Value> = Vec::new();
+    let mut clauses: Vec<String> = q.filters.iter().map(|f| f.sql(&alias(&joins, &f.column), &mut params)).collect();
+    if let Some(text) = &q.search {
+        clauses.push(search_sql(def, text, &mut params));
+    }
+    let where_sql = if clauses.is_empty() { String::new() } else { format!(" WHERE {}", clauses.join(" AND ")) };
+    Ok(Selection { from, where_sql, params, joins })
+}
+
+/// Bulk changes and deletes must say which rows: a forgotten condition must never touch a
+/// whole table. Paging and sorting make no sense for them, so they're refused, not ignored.
+fn bulk_selection(def: &TableDef, related: &Related, q: &ListQuery, doing: &str) -> Result<Selection> {
+    if q.filters.is_empty() && q.search.is_none() {
+        return Err(Error::invalid(format!(
+            "Say which rows to {doing}: add a condition, like id=in.1,2,3 or status=done. To {doing} every row, use id=gte.1."
+        )));
+    }
+    if q.limit.is_some() || q.offset.is_some() || q.sort.is_some() || !q.expand.is_empty() {
+        return Err(Error::invalid(format!(
+            "limit, offset, sort and expand can't be used to {doing} rows: every row matching the conditions is affected."
+        )));
+    }
+    selection(def, related, q, false)
+}
+
+impl Store {
+    /// Adds many rows, all or nothing, and returns them. If any row is refused, none are
+    /// added and the error says which one (counting from 1).
+    pub fn insert_rows_returning(
+        &mut self,
+        table: &str,
+        rows: &[serde_json::Map<String, serde_json::Value>],
+    ) -> Result<Vec<Row>> {
+        if rows.is_empty() {
+            return Err(Error::invalid("The list of rows is empty: send at least one row."));
+        }
+        if rows.len() > limits::MAX_BULK_ROWS {
+            return Err(Error::TooLarge(format!(
+                "At most {} rows can be added in one request. Send them in several requests.",
+                limits::MAX_BULK_ROWS
+            )));
+        }
+        let def = self.table(table)?;
+        let tx = self.conn.transaction().db()?;
+        let mut ids = Vec::with_capacity(rows.len());
+        for (i, body) in rows.iter().enumerate() {
+            ids.push(insert_checked(&tx, &def, body).map_err(|e| match e {
+                Error::Invalid(m) => Error::Invalid(format!("Row {}: {m}", i + 1)),
+                Error::TooLarge(m) => Error::TooLarge(format!("Row {}: {m}", i + 1)),
+                other => other,
+            })?);
+        }
+        tx.commit().db()?;
+        ids.into_iter().map(|id| self.get_row(table, id)).collect()
+    }
+
+    /// Changes every row `q` picks to `body`'s values, all or nothing. Returns how many rows
+    /// changed. `q` must have a condition.
+    pub fn update_rows(
+        &mut self,
+        table: &str,
+        q: &ListQuery,
+        body: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<usize> {
+        let def = self.table(table)?;
+        let related = self.related(&def)?;
+        let Selection { from, where_sql, params: picked, .. } = bulk_selection(&def, &related, q, "change")?;
+        let values = check_row(&def, body, false)?;
+        if values.is_empty() {
+            return Err(Error::invalid("Nothing to change: send at least one field."));
+        }
+        check_links(&self.conn, &def, &values)?;
+        let picked_len = picked.len();
+        let mut params = picked;
+        let mut sets = vec![format!("\"updated_at\" = {NOW}")];
+        for (name, v) in &values {
+            params.push(to_sql(v));
+            sets.push(format!("{} = ?{}", name.quoted(), params.len()));
+        }
+        let tx = self.conn.transaction().db()?;
+        let op = undo::begin(&tx, "")?;
+        let which = format!("u.\"id\" IN (SELECT t.\"id\" FROM {from}{where_sql})");
+        undo::record(&tx, op, &def, false, &which, params.get(..picked_len).unwrap_or_default())?;
+        let changed = tx
+            .execute(
+                &format!(
+                    "UPDATE {} SET {} WHERE \"id\" IN (SELECT t.\"id\" FROM {from}{where_sql})",
+                    def.name.quoted(),
+                    sets.join(", ")
+                ),
+                params_from_iter(params.iter()),
+            )
+            .db()?;
+        undo::finish(&tx, op, &format!("Changed {} in {}", undo::rows_text(changed), def.name))?;
+        tx.commit().db()?;
+        Ok(changed)
+    }
+
+    /// Deletes every row `q` picks, all or nothing, and returns how many. Links to them from
+    /// other rows are cleared, as with [`Store::delete_row`]. `q` must have a condition.
+    pub fn delete_rows(&mut self, table: &str, q: &ListQuery) -> Result<usize> {
+        let def = self.table(table)?;
+        let related = self.related(&def)?;
+        let Selection { from, where_sql, params, .. } = bulk_selection(&def, &related, q, "delete")?;
+        let incoming = self.links_into(def.name.as_str())?;
+        let linking: Vec<(TableDef, Ident)> =
+            incoming.iter().map(|(t, f)| Ok((self.table(t.as_str())?, f.clone()))).collect::<Result<_>>()?;
+        let tx = self.conn.transaction().db()?;
+        // The conditions may look at links that the clean-up below changes, so pick the rows once.
+        tx.execute("CREATE TEMP TABLE IF NOT EXISTS _porchly_picked (id INTEGER PRIMARY KEY)", []).db()?;
+        tx.execute("DELETE FROM _porchly_picked", []).db()?;
+        tx.execute(
+            &format!("INSERT INTO _porchly_picked (id) SELECT DISTINCT t.\"id\" FROM {from}{where_sql}"),
+            params_from_iter(params.iter()),
+        )
+        .db()?;
+        let op = undo::begin(&tx, "")?;
+        undo::record(&tx, op, &def, true, "u.\"id\" IN (SELECT id FROM _porchly_picked)", &[])?;
+        for (t, f) in &linking {
+            undo::record(&tx, op, t, false, &format!("u.{} IN (SELECT id FROM _porchly_picked)", f.quoted()), &[])?;
+        }
+        for (t, f) in &incoming {
+            tx.execute(
+                &format!(
+                    "UPDATE {} SET {} = NULL, \"updated_at\" = {NOW} WHERE {} IN (SELECT id FROM _porchly_picked)",
+                    t.quoted(),
+                    f.quoted(),
+                    f.quoted()
+                ),
+                [],
+            )
+            .db()?;
+        }
+        let deleted = tx
+            .execute(&format!("DELETE FROM {} WHERE \"id\" IN (SELECT id FROM _porchly_picked)", def.name.quoted()), [])
+            .db()?;
+        tx.execute("DELETE FROM _porchly_picked", []).db()?;
+        undo::finish(&tx, op, &format!("Deleted {} from {}", undo::rows_text(deleted), def.name))?;
+        tx.commit().db()?;
+        Ok(deleted)
     }
 }
 
@@ -765,5 +931,89 @@ mod tests {
         let def = s.table("recipes").unwrap();
         let pairs: Vec<(&str, &str)> = std::iter::repeat_n(("minutes", "1"), limits::MAX_FILTERS + 1).collect();
         assert!(matches!(ListQuery::parse(&def, &Related::new(), pairs), Err(Error::TooLarge(_))));
+    }
+
+    #[test]
+    fn bulk_insert_returns_the_rows_and_is_all_or_nothing() {
+        let (_dir, mut s) = shop();
+        let rows = [body(json!({"item": "Salt", "quantity": 1, "customer": 2})), body(json!({"item": "Rice"}))];
+        let added = s.insert_rows_returning("orders", &rows).unwrap();
+        assert_eq!(added.len(), 2);
+        assert_eq!((added[0]["id"].as_i64(), added[1]["item"].as_str()), (Some(6), Some("Rice")));
+
+        let bad = [body(json!({"item": "Ok"})), body(json!({"item": "Bad", "quantity": "lots"}))];
+        let err = s.insert_rows_returning("orders", &bad).unwrap_err();
+        assert!(err.to_string().starts_with("Row 2:"), "{err}");
+        let bad_link = [body(json!({"item": "Ok"})), body(json!({"item": "Bad", "customer": 99}))];
+        assert!(s.insert_rows_returning("orders", &bad_link).is_err());
+        assert_eq!(s.list_rows("orders", &ListQuery::default()).unwrap().total, 7, "nothing from the failed lists");
+
+        assert!(s.insert_rows_returning("orders", &[]).is_err());
+        let many = vec![body(json!({"item": "x"})); limits::MAX_BULK_ROWS + 1];
+        assert!(matches!(s.insert_rows_returning("orders", &many), Err(Error::TooLarge(_))));
+    }
+
+    #[test]
+    fn bulk_update_changes_only_matching_rows() {
+        let (_dir, mut s) = shop();
+        let q = |s: &Store, pairs: &[(&str, &str)]| s.list_query("orders", pairs.iter().copied()).unwrap();
+        // By ids, by a field, and by a field of a linked table.
+        assert_eq!(s.update_rows("orders", &q(&s, &[("id", "in.1,2")]), &body(json!({"quantity": 9}))).unwrap(), 2);
+        assert_eq!(items(&s, &[("quantity", "9")]), ["Tea", "Jam"]);
+        assert_eq!(
+            s.update_rows("orders", &q(&s, &[("customer.city", "Paris")]), &body(json!({"quantity": 5}))).unwrap(),
+            3
+        );
+        assert_eq!(items(&s, &[("quantity", "5")]), ["Tea", "Bread", "Milk"]);
+        assert_eq!(s.update_rows("orders", &q(&s, &[("item", "Nothing")]), &body(json!({"quantity": 1}))).unwrap(), 0);
+
+        // Bad values, bad links and no values change nothing.
+        let all = q(&s, &[("id", "gte.1")]);
+        assert!(s.update_rows("orders", &all, &body(json!({"quantity": "lots"}))).is_err());
+        assert!(s.update_rows("orders", &all, &body(json!({"customer": 99}))).is_err());
+        assert!(s.update_rows("orders", &all, &body(json!({}))).is_err());
+        assert_eq!(items(&s, &[("quantity", "5")]).len(), 3);
+        assert_eq!(
+            s.update_rows("orders", &all, &body(json!({"customer": null}))).unwrap(),
+            5,
+            "every row, on purpose"
+        );
+    }
+
+    #[test]
+    fn bulk_changes_must_say_which_rows() {
+        let (_dir, mut s) = shop();
+        let none = ListQuery::default();
+        let err = s.update_rows("orders", &none, &body(json!({"quantity": 0}))).unwrap_err();
+        assert!(err.to_string().contains("Say which rows to change"), "{err}");
+        assert!(s.delete_rows("orders", &none).unwrap_err().to_string().contains("Say which rows to delete"));
+        for pairs in
+            [[("limit", "1"), ("id", "gte.1")], [("sort", "item"), ("id", "gte.1")], [("offset", "1"), ("id", "gte.1")]]
+        {
+            let q = s.list_query("orders", pairs.iter().copied()).unwrap();
+            assert!(s.delete_rows("orders", &q).is_err(), "{pairs:?} would suggest only some rows go");
+            assert!(s.update_rows("orders", &q, &body(json!({"quantity": 0}))).is_err());
+        }
+        assert_eq!(s.list_rows("orders", &none).unwrap().total, 5, "nothing was touched");
+    }
+
+    #[test]
+    fn bulk_delete_clears_links_to_the_deleted_rows() {
+        let (_dir, mut s) = shop();
+        let paris = s.list_query("customers", [("city", "Paris")]).unwrap();
+        assert_eq!(s.delete_rows("customers", &paris).unwrap(), 2);
+        assert_eq!(s.list_rows("customers", &ListQuery::default()).unwrap().total, 1);
+        assert_eq!(s.list_rows("orders", &ListQuery::default()).unwrap().total, 5, "orders are never deleted along");
+        assert_eq!(items(&s, &[("customer", "is.empty")]), ["Tea", "Bread", "Milk", "Gift"]);
+        assert_eq!(items(&s, &[("customer", "2")]), ["Jam"], "Bob's order still links to Bob");
+
+        // By a linked field, and by search.
+        let q = s.list_query("orders", [("customer.name", "Bob")]).unwrap();
+        assert_eq!(s.delete_rows("orders", &q).unwrap(), 1);
+        let q = s.list_query("orders", [("search", "gift")]).unwrap();
+        assert_eq!(s.delete_rows("orders", &q).unwrap(), 1);
+        assert_eq!(items(&s, &[]), ["Tea", "Bread", "Milk"]);
+        let q = s.list_query("orders", [("id", "in.98,99")]).unwrap();
+        assert_eq!(s.delete_rows("orders", &q).unwrap(), 0, "no match is not an error");
     }
 }

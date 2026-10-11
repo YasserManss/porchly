@@ -14,6 +14,7 @@ const LAYERS: &[(&str, u8)] = &[
     ("porchly-schema", 1),
     ("porchly-store", 1),
     ("porchly-fetch", 1),
+    ("porchly-secrets", 1),
     ("porchly-api", 2),
     ("porchly-pipeline", 2),
     ("porchly-automate", 2),

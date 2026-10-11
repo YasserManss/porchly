@@ -616,3 +616,210 @@ fn settings_are_simple_choices() {
     settle(&mut h);
     assert!(h.query_by_label_contains("from 1024 to 65535").is_some(), "explains why");
 }
+
+#[test]
+fn several_rows_can_be_deleted_at_once() {
+    let mut h = harness(true);
+    assert!(h.query_by_label("Delete selected\u{2026}").is_none(), "nothing offered until rows are ticked");
+    h.get_by_label("Select row 2").click();
+    h.get_by_label("Select row 5").click();
+    settle(&mut h);
+    assert!(h.query_by_label("2 rows selected").is_some());
+    assert!(h.query_by_label("Add row").is_none(), "the bar shows what can be done with the ticked rows");
+
+    // Cancel keeps everything.
+    h.get_by_label("Delete selected\u{2026}").click();
+    settle(&mut h);
+    assert!(h.query_by_label("Delete 2 rows?").is_some());
+    h.get_by_label("Cancel").click();
+    settle(&mut h);
+    assert!(h.query_by_label("6 rows").is_some());
+
+    h.get_by_label("Delete selected\u{2026}").click();
+    settle(&mut h);
+    h.get_by_label("Delete 2 rows").click();
+    settle(&mut h);
+    assert!(h.query_by_label("4 rows").is_some());
+    assert!(h.query_by_label("Select row 2").is_none() && h.query_by_label("Select row 5").is_none());
+    assert!(h.query_by_label("Select row 3").is_some(), "the others are untouched");
+    assert!(h.query_by_label("Add row").is_some(), "the selection is over");
+
+    // Everything on the page, then nothing.
+    h.get_by_label("Select all rows on this page").click();
+    settle(&mut h);
+    assert!(h.query_by_label("4 rows selected").is_some());
+    h.get_by_label("Clear selection").click();
+    settle(&mut h);
+    assert!(h.query_by_label("4 rows selected").is_none());
+    assert!(h.query_by_label("4 rows").is_some());
+}
+
+#[test]
+fn a_deleted_row_can_be_brought_back_with_undo() {
+    let mut h = harness(true);
+    h.get_all_by_label("Delete this row\u{2026}").next().unwrap().click();
+    settle(&mut h);
+    assert!(h.query_by_label_contains("You can undo this afterwards").is_some());
+    h.get_by_label("Delete row").click();
+    settle(&mut h);
+    assert!(h.query_by_label("5 rows").is_some());
+    h.get_by_label("Undo").click();
+    settle(&mut h);
+    assert!(h.query_by_label("6 rows").is_some(), "the row is back");
+    assert!(h.query_by_label("Select row 1").is_some(), "with its number");
+    assert!(h.query_by_label("Undo").is_none(), "nothing more to undo from here");
+}
+
+#[test]
+fn the_backups_window_undoes_changes_and_goes_back_to_a_backup() {
+    let (dir, mut h) = functions_project(false);
+    assert!(dir.path().join("backups").is_dir(), "today's backup exists as soon as the project opens");
+
+    // Delete two rows, then undo that from the Backups window.
+    h.get_by_label("Select row 2").click();
+    h.get_by_label("Select row 3").click();
+    settle(&mut h);
+    h.get_by_label("Delete selected\u{2026}").click();
+    settle(&mut h);
+    h.get_by_label("Delete 2 rows").click();
+    settle(&mut h);
+    assert!(h.query_by_label("4 rows").is_some());
+    h.get_by_label("Backups").click();
+    settle(&mut h);
+    assert!(h.query_by_label("Deleted 2 rows from recipes").is_some());
+    // The notice under the window also offers Undo; the window's own comes last.
+    h.get_all_by_label("Undo").last().unwrap().click();
+    settle(&mut h);
+    assert!(h.query_by_label("Undone").is_some(), "the window stays open and shows it");
+    h.get_by_label("Close").click();
+    settle(&mut h);
+    assert!(h.query_by_label("6 rows").is_some());
+
+    // Back up now, delete the whole table, then go back.
+    h.get_by_label("Backups").click();
+    settle(&mut h);
+    h.get_by_label("Back up now").click();
+    settle(&mut h);
+    assert!(h.query_by_label("Backup made by hand").is_some());
+    h.get_by_label("Close").click();
+    settle(&mut h);
+    h.get_by_label("Delete this table\u{2026}").click();
+    settle(&mut h);
+    h.get_by_label("Delete table").click();
+    settle(&mut h);
+    assert!(h.query_by_label("Make your first table").is_some(), "no tables left");
+
+    h.get_by_label("Backups").click();
+    settle(&mut h);
+    let hand_made = h
+        .get_all_by_label("Go back\u{2026}")
+        .find(|n| n.accesskit_node().description().is_some_and(|d| d.contains("Backup made by hand")))
+        .or_else(|| h.get_all_by_label("Go back\u{2026}").last());
+    hand_made.unwrap().click();
+    settle(&mut h);
+    assert!(h.query_by_label("Go back to this backup?").is_some(), "asks first");
+    h.get_by_label("Go back to this backup").click();
+    settle(&mut h);
+    assert!(h.query_by_label("6 rows").is_some(), "the table and its rows are back");
+}
+
+#[test]
+fn connecting_an_ai_assistant_shows_what_to_paste() {
+    let mut h = harness(true);
+    h.get_by_label("Share").click();
+    settle(&mut h);
+    h.get_by_label("Connect an AI assistant\u{2026}").click();
+    settle(&mut h);
+    assert!(h.query_by_label_contains("claude mcp add --transport http porchly http://127.0.0.1:11911/mcp").is_some());
+    assert!(h.query_by_label_contains("\"command\"").is_some(), "and the program to start, for Claude Desktop");
+    assert!(h.query_by_label("Copied").is_none());
+    h.get_all_by_label("Copy").next().unwrap().click();
+    settle(&mut h);
+    assert!(h.query_by_label("Copied").is_some());
+    // Straight on to making the key it needs.
+    h.get_all_by_label("New key").last().unwrap().click();
+    settle(&mut h);
+    assert!(h.query_by_label("Make key").is_some());
+}
+
+#[test]
+fn setting_up_your_own_address() {
+    let (_dir, mut h) = functions_project(false);
+    h.get_by_label("Share").click();
+    settle(&mut h);
+    h.get_by_label("Use your own address\u{2026}").click();
+    settle(&mut h);
+    assert!(h.query_by_label("http://localhost:11920").is_some(), "says where the tunnel must send visitors");
+
+    // Something that isn't a token is refused, with the reason shown in the dialog.
+    let paste = |h: &mut Harness<'static, PorchlyApp>, text: &str| {
+        // The token box hides what's typed, so it's a password field.
+        h.get_by_role(egui::accesskit::Role::PasswordInput).click();
+        h.run_steps(2);
+        h.get_by_role(egui::accesskit::Role::PasswordInput).type_text(text);
+        settle(h);
+    };
+    paste(&mut h, "hello");
+    h.get_by_label("Save").click();
+    settle(&mut h);
+    assert!(h.query_by_label_contains("doesn't look like a Cloudflare tunnel token").is_some());
+    h.get_by_label("Cancel").click();
+    settle(&mut h);
+
+    // The whole command Cloudflare shows is fine. (A made-up token of the right shape.)
+    h.get_by_label("Use your own address\u{2026}").click();
+    settle(&mut h);
+    let token = "eyJhIjoiMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYiLCJ0IjoiMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1IiwicyI6ImMyVmpjbVYwTFhObFkzSmxkQzF6WldOeVpYUT0ifQ==";
+    paste(&mut h, &format!("cloudflared service install {token}"));
+    h.get_by_label("Save").click();
+    settle(&mut h);
+    assert!(h.query_by_label_contains("Saved until Porchly closes").is_some(), "this test engine has no keychain");
+    assert!(h.query_by_label("Your own address is set up. Change\u{2026}").is_some());
+    assert!(h.query_by_label_contains(token).is_none(), "the token is never shown");
+
+    // Turning the light on now offers the choice, own address first.
+    h.get_by_label("Turn on the porch light\u{2026}").click();
+    settle(&mut h);
+    let own = h.get_by_label("At your own address (stays the same)");
+    assert_eq!(own.accesskit_node().toggled(), Some(egui::accesskit::Toggled::True));
+    assert!(h.query_by_label("With a temporary link (changes every time)").is_some());
+    h.get_by_label("Cancel").click();
+    settle(&mut h);
+
+    // And it can be forgotten.
+    h.get_by_label("Your own address is set up. Change\u{2026}").click();
+    settle(&mut h);
+    h.get_by_label("Forget the token").click();
+    settle(&mut h);
+    assert!(h.query_by_label("Use your own address\u{2026}").is_some());
+}
+
+#[test]
+fn stats_show_the_numbers_and_keep_up_by_themselves() {
+    let engine = Engine::new_offline(Store::open_in_memory().unwrap().into_shared());
+    engine.execute("sample.load", &json!({})).unwrap();
+    let outside = engine.clone();
+    let mut h = harness_with(engine, None);
+    h.get_by_label("Stats").click();
+    settle(&mut h);
+    assert!(h.query_by_label("Requests in the last hour").is_some());
+    assert!(h.query_by_label_contains("These numbers stay on this computer").is_some());
+    assert!(h.query_by_label_contains("Requests in the last hour: 0 in all").is_some(), "the chart, in words");
+    assert!(h.query_by_label("No app has used a key yet.").is_some());
+    // The Rows tile and the table's row count.
+    assert!(h.query_all_by_label("6").next().is_some());
+
+    // Rows added elsewhere (an app, a script) show up without doing anything.
+    outside
+        .execute("row.insert_many", &json!({"table": "recipes", "rows": [{"name": "a"}, {"name": "b"}, {"name": "c"}]}))
+        .unwrap();
+    let start = std::time::Instant::now();
+    while h.query_all_by_label("9").next().is_none() && start.elapsed() < std::time::Duration::from_secs(5) {
+        h.run_steps(4);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(h.query_all_by_label("9").next().is_some(), "the window refreshed itself");
+    h.get_by_label("Close").click();
+    settle(&mut h);
+    assert!(h.query_by_label("Requests in the last hour").is_none());
+}

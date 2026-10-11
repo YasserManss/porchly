@@ -27,6 +27,9 @@ pub struct Tokens {
     pub danger: Color32,
     pub danger_soft: Color32,
     pub off: Color32,
+    /// Marks in charts (bars). Checked for both surfaces with the dataviz palette validator:
+    /// the dark accent is too light for marks, so dark mode has its own step.
+    pub chart: Color32,
 }
 
 impl Tokens {
@@ -49,6 +52,7 @@ impl Tokens {
             danger: Color32::from_rgb(0xB4, 0x23, 0x18),
             danger_soft: Color32::from_rgb(0xFD, 0xE8, 0xE6),
             off: Color32::from_rgb(0x9A, 0x93, 0x8A),
+            chart: Color32::from_rgb(0xB0, 0x65, 0x07),
         }
     }
 
@@ -71,6 +75,7 @@ impl Tokens {
             danger: Color32::from_rgb(0xF9, 0x73, 0x69),
             danger_soft: Color32::from_rgb(0x3D, 0x21, 0x1E),
             off: Color32::from_rgb(0x7A, 0x73, 0x6B),
+            chart: Color32::from_rgb(0xBF, 0x7E, 0x22),
         }
     }
 

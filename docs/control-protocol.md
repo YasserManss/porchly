@@ -31,6 +31,8 @@ The first message on a connection must be `auth`. Anything else, or a wrong toke
 | `ui.search` | `text` | Types into the grid's search box. |
 | `ui.screenshot` | `path?` | A PNG of the window: written to `path`, or returned as `png_base64`. Also `width`, `height` (in pixels; larger than the window on high-resolution screens). |
 
+`engine.execute` reaches every command, including `undo.run` and `backup.restore`.
+
 ## Example (Python)
 ```python
 import json, socket

@@ -10,11 +10,18 @@ use crate::names::pretty;
 use crate::theme::Tokens;
 use crate::{Dialog, LinkChoices, PorchlyApp};
 
-const ID_WIDTH: f32 = 44.0;
+/// The first column: a checkbox for choosing the row, then its number.
+const ID_WIDTH: f32 = 52.0;
 const ROW_HEIGHT: f32 = 30.0;
+/// The checkbox inside the first column.
+const PICK_WIDTH: f32 = 18.0;
 
 enum Action {
-    Update { id: i64, field: String, value: Value },
+    Update {
+        id: i64,
+        field: String,
+        value: Value,
+    },
     Insert(Map<String, Value>),
     Ask(Dialog),
     Error(String),
@@ -22,6 +29,10 @@ enum Action {
     LinkQuery(String, String),
     Page(u64),
     Search(String),
+    /// Tick or untick one row.
+    Pick(i64, bool),
+    /// Tick or untick every row on this page.
+    PickAll(bool),
 }
 
 pub(crate) fn show(app: &mut PorchlyApp, ui: &mut Ui, t: &Tokens) {
@@ -80,7 +91,7 @@ pub(crate) fn show(app: &mut PorchlyApp, ui: &mut Ui, t: &Tokens) {
                         .spacing([10.0, 4.0])
                         .min_row_height(ROW_HEIGHT)
                         .show(ui, |ui| {
-                            header(ui, t, &table, &mut actions);
+                            header(app, ui, t, &table, &mut actions);
                             rows(app, ui, t, &table, &mut actions);
                             new_row(app, ui, t, &table, &mut actions);
                         });
@@ -88,6 +99,20 @@ pub(crate) fn show(app: &mut PorchlyApp, ui: &mut Ui, t: &Tokens) {
         });
     ui.add_space(8.0);
     ui.horizontal(|ui| {
+        let picked = app.picked_rows.len();
+        if picked > 0 {
+            // Rows are ticked: offer what can be done with them.
+            let what = if picked == 1 { "1 row selected".to_owned() } else { format!("{picked} rows selected") };
+            ui.label(RichText::new(what).strong());
+            if icons::button(ui, Some(Icon::Trash), "Delete selected\u{2026}", false).clicked() {
+                let ids = app.picked_rows.iter().copied().collect();
+                actions.push(Action::Ask(Dialog::DeleteRows { table: table.name.clone(), ids }));
+            }
+            if icons::button(ui, None, "Clear selection", false).clicked() {
+                actions.push(Action::PickAll(false));
+            }
+            return;
+        }
         let can_add = !table.fields.is_empty();
         if ui.add_enabled_ui(can_add, |ui| icons::button(ui, Some(Icon::Plus), "Add row", true)).inner.clicked() {
             add_row(app, &table, &mut actions);
@@ -126,8 +151,46 @@ fn paging(app: &PorchlyApp, ui: &mut Ui, t: &Tokens, actions: &mut Vec<Action>) 
     });
 }
 
-fn header(ui: &mut Ui, t: &Tokens, table: &TableInfo, actions: &mut Vec<Action>) {
-    ui.add_sized([ID_WIDTH, ROW_HEIGHT], egui::Label::new(RichText::new("#").color(t.text_dim)));
+/// The first cell of a row: a checkbox for choosing it (named for screen readers and tests),
+/// then `text` (the row's number). Returns the new state when the checkbox was clicked.
+fn pick_cell(ui: &mut Ui, t: &Tokens, on: Option<bool>, label: &str, text: &str) -> Option<bool> {
+    let mut clicked = None;
+    ui.allocate_ui_with_layout(
+        egui::vec2(ID_WIDTH, ROW_HEIGHT),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            match on {
+                Some(on) => {
+                    let mut value = on;
+                    let response = ui.add_sized([PICK_WIDTH, ROW_HEIGHT], egui::Checkbox::without_text(&mut value));
+                    response.widget_info(|| {
+                        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), value, label)
+                    });
+                    if response.on_hover_text(label).changed() {
+                        clicked = Some(value);
+                    }
+                }
+                None => {
+                    ui.allocate_exact_size(egui::vec2(PICK_WIDTH, ROW_HEIGHT), egui::Sense::hover());
+                }
+            }
+            ui.add_sized(
+                [ID_WIDTH - PICK_WIDTH - 2.0, ROW_HEIGHT],
+                egui::Label::new(RichText::new(text).color(t.text_dim)),
+            );
+        },
+    );
+    clicked
+}
+
+fn header(app: &PorchlyApp, ui: &mut Ui, t: &Tokens, table: &TableInfo, actions: &mut Vec<Action>) {
+    let all = !app.rows.is_empty()
+        && app.rows.iter().filter_map(|r| r.get("id").and_then(Value::as_i64)).all(|id| app.picked_rows.contains(&id));
+    let state = (!app.rows.is_empty()).then_some(all);
+    if let Some(on) = pick_cell(ui, t, state, "Select all rows on this page", "#") {
+        actions.push(Action::PickAll(on));
+    }
     for f in &table.fields {
         let edit = || Dialog::edit_field(&table.name, &f.name, f.kind, f.required, f.links_to.clone());
         let response = field_header(ui, t, f);
@@ -191,7 +254,10 @@ fn rows(app: &mut PorchlyApp, ui: &mut Ui, t: &Tokens, table: &TableInfo, action
     let edits = &mut app.edits;
     for row in &app.rows {
         let Some(id) = row.get("id").and_then(Value::as_i64) else { continue };
-        ui.add_sized([ID_WIDTH, ROW_HEIGHT], egui::Label::new(RichText::new(id.to_string()).color(t.text_dim)));
+        let picked = Some(app.picked_rows.contains(&id));
+        if let Some(on) = pick_cell(ui, t, picked, &format!("Select row {id}"), &id.to_string()) {
+            actions.push(Action::Pick(id, on));
+        }
         for f in &table.fields {
             let current = row.get(&f.name);
             if f.kind == FieldKind::Boolean {
@@ -358,6 +424,19 @@ fn apply(app: &mut PorchlyApp, table: &TableInfo, actions: Vec<Action>) {
                 reload = true;
             }
             Action::Ask(dialog) => app.open_dialog(dialog),
+            Action::Pick(id, on) => {
+                if on {
+                    app.picked_rows.insert(id);
+                } else {
+                    app.picked_rows.remove(&id);
+                }
+            }
+            Action::PickAll(on) => {
+                app.picked_rows.clear();
+                if on {
+                    app.picked_rows.extend(app.rows.iter().filter_map(|r| r.get("id").and_then(Value::as_i64)));
+                }
+            }
             Action::Error(e) => app.error(e),
             Action::LinkQuery(target, text) => app.set_link_query(&target, text),
             Action::Page(offset) => app.go_to_page(offset),

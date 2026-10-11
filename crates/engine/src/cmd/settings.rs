@@ -19,6 +19,8 @@ const OLD_RATE: &str = "rate_limit";
 const TIMEOUT: &str = "function_timeout";
 const PORT: &str = "port";
 const START_API: &str = "start_api";
+/// The command parameter for letting AI assistants make tables and fields.
+const AI_TABLES: &str = "ai_can_make_tables";
 
 /// Requests per second each app (key) may make.
 const MAX_RATE: u32 = 1000;
@@ -33,7 +35,7 @@ pub(super) fn commands() -> Vec<Command> {
             label: "Settings",
             menu: "Porchly/Settings…",
             shortcut: None,
-            params: "none. Returns {requests_per_second, function_timeout: seconds (0 = no limit), port, start_api, choices}.",
+            params: "none. Returns {requests_per_second, function_timeout: seconds (0 = no limit), port, start_api, ai_can_make_tables, choices}.",
             enabled: always,
             run: get,
         },
@@ -42,7 +44,7 @@ pub(super) fn commands() -> Vec<Command> {
             label: "Change settings",
             menu: "",
             shortcut: None,
-            params: "Any of: requests_per_second: 1-1000 (per app/key; default 20); function_timeout: 10 | 30 | 60 | 300 | 0 (seconds, 0 = no limit); port: 1024-65535 (restarts the API if it's on); start_api: bool (turn the API on when the app opens).",
+            params: "Any of: requests_per_second: 1-1000 (per app/key; default 20); function_timeout: 10 | 30 | 60 | 300 | 0 (seconds, 0 = no limit); port: 1024-65535 (restarts the API if it's on); start_api: bool (turn the API on when the app opens); ai_can_make_tables: bool (AI assistants connected over MCP may make tables and fields; default false).",
             enabled: always,
             run: set,
         },
@@ -99,6 +101,7 @@ fn snapshot(store: &Store) -> Value {
         "function_timeout": timeout_secs(store),
         "port": port_setting(store),
         "start_api": start_api(store),
+        "ai_can_make_tables": store.setting(porchly_api::mcp::TABLES_SETTING).ok().flatten().as_deref() == Some("on"),
         "choices": {
             "requests_per_second": { "min": 1, "max": MAX_RATE },
             "function_timeout": TIMEOUTS,
@@ -130,6 +133,7 @@ fn set(cx: &mut Ctx<'_>, params: &Value) -> Result<Value> {
         })?),
     };
     let start = p.opt_bool(START_API)?;
+    let ai_tables = p.opt_bool(AI_TABLES)?;
 
     let store = cx.store();
     if let Some(r) = rate {
@@ -145,6 +149,9 @@ fn set(cx: &mut Ctx<'_>, params: &Value) -> Result<Value> {
     }
     if let Some(on) = start {
         store.set_setting(START_API, (!on).then_some("off"))?;
+    }
+    if let Some(on) = ai_tables {
+        store.set_setting(porchly_api::mcp::TABLES_SETTING, on.then_some("on"))?;
     }
     let (net, functions) = (cx.net(), cx.functions().clone());
     apply_settings(cx.store(), net, &functions);

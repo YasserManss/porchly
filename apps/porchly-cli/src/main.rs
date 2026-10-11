@@ -39,6 +39,17 @@ enum Cmd {
         #[arg(long = "cmd", required = true)]
         cmds: Vec<String>,
     },
+    /// Let an AI assistant use the project (MCP over standard input and output). Assistants
+    /// that start a program, like Claude Desktop, run this. It can only read unless --write
+    /// is given.
+    Mcp {
+        /// The project file (it must exist).
+        #[arg(long)]
+        project: PathBuf,
+        /// Also let the assistant add, change and delete rows (these can be undone).
+        #[arg(long)]
+        write: bool,
+    },
     /// List commands, optionally only those whose id contains FILTER.
     Commands { filter: Option<String> },
     /// Show a command's parameters.
@@ -50,6 +61,7 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Cmd::Serve { project, port, host } => serve(&project, host, port),
         Cmd::Run { project, cmds } => run(&project, &cmds),
+        Cmd::Mcp { project, write } => mcp(&project, write),
         Cmd::Commands { filter } => {
             list_commands(filter.as_deref());
             Ok(())
@@ -109,6 +121,16 @@ fn serve(project: &Path, host: IpAddr, port: Option<u16>) -> Result<(), String> 
         let folder = functions.get("folder").and_then(Value::as_str).unwrap_or("functions/");
         eprintln!("Functions are on: /api/fn/<name> runs the code in {folder}");
     }
+    // A server may run for weeks: make sure each day gets its backup.
+    let daily = engine.clone();
+    let _ = std::thread::Builder::new().name("porchly-daily-backup".into()).spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(3600));
+            if let Err(e) = daily.execute("backup.daily", &Value::Null) {
+                eprintln!("Warning: couldn't make today's backup: {e}");
+            }
+        }
+    });
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -118,6 +140,43 @@ fn serve(project: &Path, host: IpAddr, port: Option<u16>) -> Result<(), String> 
             let _ = tokio::signal::ctrl_c().await;
         }))
         .map_err(|e| format!("couldn't serve on {addr}: {e}"))
+}
+
+/// Answers MCP messages, one JSON object per line, until standard input closes. Nothing but
+/// answers goes to standard output; notes for people go to standard error.
+fn mcp(project: &Path, write: bool) -> Result<(), String> {
+    use std::io::{BufRead, Write};
+    let store = Store::open_existing(project).map_err(|e| e.to_string())?;
+    // Through the engine, so the daily backup and settings apply here too.
+    let engine = Engine::new(store.into_shared());
+    let shared = engine.store();
+    eprintln!(
+        "Porchly MCP for {} ({}). Waiting for an assistant on standard input.",
+        project.display(),
+        if write { "may make changes" } else { "read-only; start with --write to allow changes" }
+    );
+    let mut out = std::io::stdout().lock();
+    for line in std::io::stdin().lock().lines() {
+        let line = line.map_err(|e| format!("couldn't read standard input: {e}"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let answer = match serde_json::from_str::<Value>(&line) {
+            Ok(message) => {
+                let mut store = porchly_store::lock(&shared);
+                let caller = porchly_api::mcp::Caller::new(&store, write);
+                porchly_api::mcp::handle(&mut store, caller, &message)
+            }
+            Err(e) => Some(serde_json::json!({
+                "jsonrpc": "2.0", "id": null,
+                "error": { "code": -32700, "message": format!("That line isn't valid JSON: {e}") }
+            })),
+        };
+        if let Some(answer) = answer {
+            writeln!(out, "{answer}").and_then(|()| out.flush()).map_err(|e| format!("couldn't answer: {e}"))?;
+        }
+    }
+    Ok(())
 }
 
 fn run(project: &Path, cmds: &[String]) -> Result<(), String> {

@@ -179,6 +179,66 @@ impl Folder {
     }
 }
 
+/// Folders never copied into backups: downloaded packages and Porchly's own bin.
+const NOT_BACKED_UP: [&str; 2] = ["node_modules", DELETED_DIR];
+/// Bigger files are left out of backups (code and settings are small).
+const MAX_BACKUP_FILE_BYTES: u64 = 5 * 1024 * 1024;
+
+impl Folder {
+    /// Copies every function's code and settings into `dest` (for a backup). Returns how
+    /// many files were copied; 0 (and no folder) when there are no functions.
+    pub fn copy_code_to(&self, dest: &Path) -> Result<usize> {
+        if !self.root.is_dir() {
+            return Ok(0);
+        }
+        let mut copied = 0;
+        copy_tree(&self.root, dest, 0, &mut copied)?;
+        Ok(copied)
+    }
+
+    /// Puts back the code saved in `src` by [`Folder::copy_code_to`]. What's there now is
+    /// first kept in `functions/.deleted/before-restore-<time>/`. Functions that aren't in
+    /// `src` are left alone.
+    pub fn restore_code_from(&self, src: &Path) -> Result<usize> {
+        if !src.is_dir() {
+            return Ok(0);
+        }
+        if self.root.is_dir() {
+            let stamp =
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            let keep = self.root.join(DELETED_DIR).join(format!("before-restore-{stamp}"));
+            let mut kept = 0;
+            copy_tree(&self.root, &keep, 0, &mut kept)?;
+        }
+        let mut copied = 0;
+        copy_tree(src, &self.root, 0, &mut copied)?;
+        Ok(copied)
+    }
+}
+
+fn copy_tree(from: &Path, to: &Path, depth: usize, copied: &mut usize) -> Result<()> {
+    // Function folders are shallow; a runaway tree (or a link loop) stops here.
+    if depth > 8 {
+        return Ok(());
+    }
+    let entries = std::fs::read_dir(from).map_err(|e| io_error(from, &e))?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Ok(kind) = entry.file_type() else { continue };
+        if kind.is_dir() {
+            if NOT_BACKED_UP.iter().any(|skip| name == *skip) {
+                continue;
+            }
+            copy_tree(&entry.path(), &to.join(&name), depth + 1, copied)?;
+        } else if kind.is_file() && entry.metadata().is_ok_and(|m| m.len() <= MAX_BACKUP_FILE_BYTES) {
+            std::fs::create_dir_all(to).map_err(|e| io_error(to, &e))?;
+            std::fs::copy(entry.path(), to.join(&name)).map_err(|e| io_error(to, &e))?;
+            *copied += 1;
+        }
+    }
+    Ok(())
+}
+
 fn valid_name(name: &str) -> Result<Ident> {
     Ident::new(name).map_err(|_| {
         Error::invalid(format!(
@@ -350,6 +410,34 @@ mod tests {
         assert_eq!(f.settings("hook").unwrap().access, FnAccess::Key);
         std::fs::remove_file(f.root().join("hook").join(SETTINGS_FILE)).unwrap();
         assert_eq!(f.settings("hook").unwrap(), Settings::default());
+    }
+
+    #[test]
+    fn code_is_copied_for_backups_and_put_back() {
+        let (dir, f) = folder();
+        f.create("hello", None).unwrap();
+        f.save("hello", "export default { fetch: () => new Response('v1') };").unwrap();
+        std::fs::create_dir_all(f.root().join("hello/node_modules/big")).unwrap();
+        std::fs::write(f.root().join("hello/node_modules/big/index.js"), "x").unwrap();
+        std::fs::create_dir_all(f.root().join("hello/lib")).unwrap();
+        std::fs::write(f.root().join("hello/lib/util.ts"), "export const a = 1;").unwrap();
+        let backup = dir.path().join("backup.functions");
+        assert_eq!(f.copy_code_to(&backup).unwrap(), 3, "main.ts, function.json and lib/util.ts");
+        assert!(!backup.join("hello/node_modules").exists(), "downloaded packages aren't backed up");
+
+        // Later: the code changes, another function appears, one is deleted.
+        f.save("hello", "export default { fetch: () => new Response('v2') };").unwrap();
+        f.create("newer", None).unwrap();
+        assert_eq!(f.restore_code_from(&backup).unwrap(), 3);
+        assert!(f.code("hello").unwrap().contains("v1"));
+        assert!(f.exists("newer"), "functions made since are left alone");
+        let kept = std::fs::read_dir(f.root().join(DELETED_DIR)).unwrap().next().unwrap().unwrap().path();
+        assert!(std::fs::read_to_string(kept.join("hello/main.ts")).unwrap().contains("v2"), "what was there is kept");
+        // Nothing to copy, nothing made.
+        let (dir2, empty) = folder();
+        assert_eq!(empty.copy_code_to(&dir2.path().join("b")).unwrap(), 0);
+        assert!(!dir2.path().join("b").exists());
+        assert_eq!(empty.restore_code_from(&dir2.path().join("missing")).unwrap(), 0);
     }
 
     #[test]

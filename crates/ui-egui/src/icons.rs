@@ -21,6 +21,10 @@ pub enum Icon {
     Code,
     /// Settings: a gear.
     Gear,
+    /// Backups and undo: a clock.
+    History,
+    /// Stats: three bars.
+    Stats,
 }
 
 /// Paints `icon` inside `rect` with `color`.
@@ -92,6 +96,16 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
             let dir = if icon == Icon::Import { -1.0 } else { 1.0 };
             painter.line_segment([tip, pos2(tip.x - s * 0.18, tip.y + dir * s * 0.18)], stroke);
             painter.line_segment([tip, pos2(tip.x + s * 0.18, tip.y + dir * s * 0.18)], stroke);
+        }
+        Icon::Stats => {
+            for (x, top) in [(-0.6, 0.1), (0.0, -0.7), (0.6, -0.25)] {
+                painter.line_segment([p(x, 0.75), p(x, top)], Stroke::new((s / 5.5).max(2.0), color));
+            }
+        }
+        Icon::History => {
+            painter.circle_stroke(c, s * 0.42, stroke);
+            painter.line_segment([c, p(0.0, -0.5)], stroke);
+            painter.line_segment([c, p(0.38, 0.2)], stroke);
         }
         Icon::Gear => {
             painter.circle_stroke(c, s * 0.2, stroke);

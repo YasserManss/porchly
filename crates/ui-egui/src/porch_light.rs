@@ -21,6 +21,14 @@ pub(crate) struct Light {
     pub allow_changes: bool,
     pub program_ready: bool,
     pub download: Option<(u64, u64)>,
+    /// Using the owner's own tunnel (a stable address).
+    pub own: bool,
+    /// The owner's tunnel is set up wrong in Cloudflare: what to change.
+    pub problem: Option<String>,
+    /// A token for the owner's own address was saved.
+    pub has_token: bool,
+    /// Where the owner's tunnel must send visitors (`http://localhost:11920`).
+    pub service: String,
 }
 
 impl Light {
@@ -34,6 +42,10 @@ impl Light {
             error: text("error"),
             allow_changes: flag("allow_changes"),
             program_ready: flag("program_ready"),
+            own: flag("own"),
+            problem: text("problem"),
+            has_token: flag("has_token"),
+            service: text("service").unwrap_or_default(),
             download: v.get("download").and_then(|d| Some((d.get("done")?.as_u64()?, d.get("total")?.as_u64()?))),
         }
     }
@@ -61,7 +73,8 @@ impl PorchlyApp {
     }
 
     /// Turns the porch light on in the background (it may download cloudflared first).
-    pub fn start_porch_light(&mut self, allow_changes: bool) {
+    /// `own`: use the owner's own stable address (a token must be saved) or a temporary link.
+    pub fn start_porch_light(&mut self, allow_changes: bool, own: bool) {
         if self.light_starting.is_some() {
             return;
         }
@@ -69,7 +82,9 @@ impl PorchlyApp {
         let engine = self.engine.clone();
         let spawned = std::thread::Builder::new().name("porchly-porch-light-start".into()).spawn(move || {
             let _ = tx.send(
-                engine.execute("tunnel.start", &json!({"allow_changes": allow_changes})).map_err(|e| e.to_string()),
+                engine
+                    .execute("tunnel.start", &json!({"allow_changes": allow_changes, "own": own}))
+                    .map_err(|e| e.to_string()),
             );
         });
         match spawned {
@@ -118,6 +133,7 @@ pub(crate) enum Action {
     TurnOn,
     TurnOff,
     Retry,
+    OwnAddress,
     AllowChanges(bool),
     Copy(String),
 }
@@ -128,6 +144,17 @@ pub(crate) fn section(app: &PorchlyApp, ui: &mut Ui, t: &Tokens, actions: &mut V
     match light.state.as_str() {
         "on" => {
             lamp_status(ui, t, true, "On. Apps anywhere can reach your API with a key.");
+            if let Some(problem) = &light.problem {
+                // Connected, but Cloudflare sends visitors somewhere else.
+                egui::Frame::NONE.fill(t.danger_soft).corner_radius(6).inner_margin(egui::Margin::same(8)).show(
+                    ui,
+                    |ui| {
+                        ui.label(RichText::new(problem).color(t.danger));
+                    },
+                );
+            } else if light.own && light.url.is_none() {
+                ui.label(RichText::new("Connected at the address you set up in Cloudflare.").color(t.text_dim));
+            }
             if let Some(url) = &light.url {
                 ui.horizontal(|ui| {
                     ui.add(egui::Label::new(RichText::new(url).monospace()).wrap());
@@ -137,11 +164,12 @@ pub(crate) fn section(app: &PorchlyApp, ui: &mut Ui, t: &Tokens, actions: &mut V
                 });
             }
             changes_checkbox(light, ui, t, actions);
-            ui.label(
-                RichText::new("The link changes every time you turn the light on. It's free, from Cloudflare.")
-                    .small()
-                    .color(t.text_dim),
-            );
+            let note = if light.own {
+                "This is your own address. It stays the same every time."
+            } else {
+                "The link changes every time you turn the light on. It's free, from Cloudflare."
+            };
+            ui.label(RichText::new(note).small().color(t.text_dim));
             ui.add_space(4.0);
             if icons::button(ui, None, "Turn off", false).clicked() {
                 actions.push(Action::TurnOff);
@@ -198,6 +226,19 @@ pub(crate) fn section(app: &PorchlyApp, ui: &mut Ui, t: &Tokens, actions: &mut V
             if icons::button(ui, Some(Icon::Lamp), "Turn on the porch light\u{2026}", true).clicked() {
                 actions.push(Action::TurnOn);
             }
+            ui.add_space(2.0);
+            let own = if light.has_token {
+                "Your own address is set up. Change\u{2026}"
+            } else {
+                "Use your own address\u{2026}"
+            };
+            if ui
+                .add(egui::Button::new(RichText::new(own).small().color(t.text_dim)).frame(false))
+                .on_hover_text("An address that stays the same, on a domain you own (needs a free Cloudflare account)")
+                .clicked()
+            {
+                actions.push(Action::OwnAddress);
+            }
         }
     }
 }
@@ -229,13 +270,20 @@ fn lamp_status(ui: &mut Ui, t: &Tokens, on: bool, text: &str) {
 
 pub(crate) fn apply(app: &mut PorchlyApp, ctx: &egui::Context, action: Action) {
     match action {
+        Action::OwnAddress => app.open_dialog(Dialog::OwnAddress {
+            token: String::new(),
+            has_token: app.light.has_token,
+            service: app.light.service.clone(),
+        }),
         Action::TurnOn => app.open_dialog(Dialog::PorchLight {
+            own: app.light.has_token,
+            has_token: app.light.has_token,
             allow_changes: app.light.allow_changes,
             public_functions: app.functions.iter().any(|f| f.access == "public"),
         }),
         Action::Retry => {
             app.stop_porch_light();
-            app.start_porch_light(app.light.allow_changes);
+            app.start_porch_light(app.light.allow_changes, app.light.own);
         }
         Action::TurnOff => {
             app.stop_porch_light();

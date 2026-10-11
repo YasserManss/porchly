@@ -9,7 +9,9 @@ pub mod docs;
 mod error;
 mod functions;
 mod limiter;
+pub mod mcp;
 mod openapi;
+mod stats;
 
 use std::future::Future;
 use std::sync::Arc;
@@ -23,7 +25,7 @@ use axum::extract::{DefaultBodyLimit, Path, RawQuery, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get};
+use axum::routing::{any, get, post};
 use porchly_core::{Error, Result, limits};
 use porchly_store::{KeyInfo, Shared, Store, lock};
 use serde_json::{Value, json};
@@ -33,6 +35,7 @@ pub use error::ApiError;
 pub use functions::{FnAccess, FnCall, FnCaller, FnSummary, Functions};
 use limiter::RateLimiter;
 pub use limiter::{DEFAULT_PER_SECOND, Limits};
+pub use stats::Stats;
 
 /// The port Porchly serves on unless told otherwise. Above 1024, so it never needs
 /// administrator rights, and uncommon enough to rarely clash with other apps.
@@ -46,6 +49,7 @@ struct AppState {
     internal_token: Option<Arc<str>>,
     /// Set when this server is behind the public link; true while changes are allowed.
     public: Option<Arc<AtomicBool>>,
+    stats: Arc<Stats>,
 }
 
 /// What the API serves besides the tables.
@@ -63,6 +67,8 @@ pub struct Options {
     /// The rate limit, shared so Settings can change it while the server runs.
     /// Without it, the default (20 requests a second per key) applies.
     pub limits: Option<Arc<Limits>>,
+    /// Usage numbers, shared so the app can show them (and so both servers count together).
+    pub stats: Option<Arc<Stats>>,
 }
 
 /// The name the internal token shows up as (to functions, in `X-Porchly-Key-Name`).
@@ -92,20 +98,22 @@ fn router_with_limiter(store: Shared, limiter: RateLimiter, options: Options) ->
         // Functions run on this computer and use the local address, never the public link.
         internal_token: options.internal_token.filter(|t| t.len() >= 16 && options.public.is_none()).map(Arc::from),
         public: options.public,
+        stats: options.stats.unwrap_or_default(),
     };
     Router::new()
         .route("/health", get(health))
         .route("/api", get(index))
         .route("/api/openapi.json", get(openapi_json))
         .route("/docs", get(docs_page))
+        .route("/mcp", post(mcp_http))
         .route("/api/fn/{name}", any(functions::route))
         .route("/api/fn/{name}/{*rest}", any(functions::route))
-        .route("/api/{table}", get(list).post(create))
+        .route("/api/{table}", get(list).post(create).patch(update_many).delete(remove_many))
         .route("/api/{table}/{id}", get(get_one).patch(update).delete(remove))
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(DefaultBodyLimit::max(limits::MAX_BODY_BYTES))
-        .layer(middleware::from_fn(log_and_harden))
+        .layer(middleware::from_fn_with_state(state.clone(), log_and_harden))
         .with_state(state)
 }
 
@@ -222,9 +230,74 @@ async fn create(
     body: std::result::Result<Bytes, BytesRejection>,
 ) -> std::result::Result<Response, ApiError> {
     authorize(&s, &headers, Access::Write).await?;
+    match json_body(body)? {
+        // A list of rows: all are added, or none.
+        Value::Array(rows) => {
+            let rows = rows
+                .into_iter()
+                .enumerate()
+                .map(|(i, r)| match r {
+                    Value::Object(map) => Ok(map),
+                    _ => Err(Error::invalid(format!("Row {}: each row must be a JSON object.", i + 1))),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let items = blocking(&s, move |store| store.insert_rows_returning(&table, &rows)).await?;
+            Ok((StatusCode::CREATED, axum::Json(json!({ "count": items.len(), "items": items }))).into_response())
+        }
+        Value::Object(body) => {
+            let row = blocking(&s, move |store| store.insert_row(&table, &body)).await?;
+            Ok((StatusCode::CREATED, axum::Json(row)).into_response())
+        }
+        _ => Err(Error::invalid(
+            "Send a JSON object for one row, like {\"name\": \"Pancakes\"}, or a list of objects for several.",
+        )
+        .into()),
+    }
+}
+
+/// Changes every row matching the conditions in the query string.
+async fn update_many(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Path(table): Path<String>,
+    RawQuery(query): RawQuery,
+    body: std::result::Result<Bytes, BytesRejection>,
+) -> std::result::Result<Response, ApiError> {
+    authorize(&s, &headers, Access::Write).await?;
+    let pairs = query_pairs(query)?;
     let body = json_object(body)?;
-    let row = blocking(&s, move |store| store.insert_row(&table, &body)).await?;
-    Ok((StatusCode::CREATED, axum::Json(row)).into_response())
+    let updated = blocking(&s, move |store| {
+        let q = store.list_query(&table, pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())))?;
+        store.update_rows(&table, &q, &body)
+    })
+    .await?;
+    Ok(axum::Json(json!({ "updated": updated })).into_response())
+}
+
+/// Deletes every row matching the conditions in the query string.
+async fn remove_many(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Path(table): Path<String>,
+    RawQuery(query): RawQuery,
+) -> std::result::Result<Response, ApiError> {
+    authorize(&s, &headers, Access::Write).await?;
+    let pairs = query_pairs(query)?;
+    let deleted = blocking(&s, move |store| {
+        let q = store.list_query(&table, pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())))?;
+        store.delete_rows(&table, &q)
+    })
+    .await?;
+    Ok(axum::Json(json!({ "deleted": deleted })).into_response())
+}
+
+/// The query string as key/value pairs, size-checked.
+fn query_pairs(query: Option<String>) -> Result<Vec<(String, String)>> {
+    let query = query.unwrap_or_default();
+    if query.len() > limits::MAX_QUERY_BYTES {
+        return Err(Error::TooLarge("The query string is too long.".into()));
+    }
+    Ok(form_urlencoded::parse(query.as_bytes()).map(|(k, v)| (k.into_owned(), v.into_owned())).collect())
 }
 
 async fn update(
@@ -251,6 +324,28 @@ async fn remove(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
+/// MCP for AI assistants: one JSON-RPC message in, one answer out. Same keys as the rest
+/// of the API; what a key may do decides which tools it gets (see [`mcp`]).
+async fn mcp_http(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    body: std::result::Result<Bytes, BytesRejection>,
+) -> std::result::Result<Response, ApiError> {
+    let key = authorize(&s, &headers, Access::Read).await?;
+    let can_write = key.can_write && changes_allowed(&s);
+    let message = json_body(body)?;
+    let answer = blocking(&s, move |store| {
+        let caller = mcp::Caller::new(store, can_write);
+        Ok(mcp::handle(store, caller, &message))
+    })
+    .await?;
+    Ok(match answer {
+        Some(answer) => axum::Json(answer).into_response(),
+        // Notifications have no answer.
+        None => StatusCode::ACCEPTED.into_response(),
+    })
+}
+
 async fn not_found() -> ApiError {
     Error::not_found("There's nothing here. The API lives under /api.").into()
 }
@@ -273,6 +368,7 @@ async fn authorize(s: &AppState, headers: &HeaderMap, access: Access) -> std::re
     if let Some(internal) = &s.internal_token
         && constant_time_eq(presented.as_bytes(), internal.as_bytes())
     {
+        s.stats.key_used(0, INTERNAL_KEY_NAME);
         return Ok(KeyInfo {
             id: 0,
             name: INTERNAL_KEY_NAME.to_owned(),
@@ -283,6 +379,7 @@ async fn authorize(s: &AppState, headers: &HeaderMap, access: Access) -> std::re
         });
     }
     let key = blocking(s, move |store| store.verify_key(&presented)).await?.ok_or(Error::Unauthorized)?;
+    s.stats.key_used(key.id, &key.name);
     if !s.limiter.allow(key.id) {
         return Err(ApiError::rate_limited());
     }
@@ -336,6 +433,13 @@ fn parse_id(s: &str) -> Result<i64> {
 }
 
 fn json_object(body: std::result::Result<Bytes, BytesRejection>) -> Result<serde_json::Map<String, Value>> {
+    match json_body(body)? {
+        Value::Object(map) => Ok(map),
+        _ => Err(Error::invalid("Send a JSON object, like {\"name\": \"Pancakes\"}.")),
+    }
+}
+
+fn json_body(body: std::result::Result<Bytes, BytesRejection>) -> Result<Value> {
     let bytes = body.map_err(|rejection| {
         if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
             Error::TooLarge(format!("The request is too big (the limit is {} KB).", limits::MAX_BODY_BYTES / 1024))
@@ -343,16 +447,12 @@ fn json_object(body: std::result::Result<Bytes, BytesRejection>) -> Result<serde
             Error::invalid("Couldn't read the request body.")
         }
     })?;
-    match serde_json::from_slice::<Value>(&bytes) {
-        Ok(Value::Object(map)) => Ok(map),
-        Ok(_) => Err(Error::invalid("Send a JSON object, like {\"name\": \"Pancakes\"}.")),
-        Err(e) => Err(Error::invalid(format!("The body isn't valid JSON: {e}"))),
-    }
+    serde_json::from_slice::<Value>(&bytes).map_err(|e| Error::invalid(format!("The body isn't valid JSON: {e}")))
 }
 
 /// Logs each request (method, path, status, time; never headers or query strings, which
 /// may hold keys or personal data) and adds protective headers.
-async fn log_and_harden(req: Request, next: Next) -> Response {
+async fn log_and_harden(State(s): State<AppState>, req: Request, next: Next) -> Response {
     let method = req.method().clone();
     let path = req.uri().path().chars().take(200).collect::<String>();
     let started = Instant::now();
@@ -366,6 +466,7 @@ async fn log_and_harden(req: Request, next: Next) -> Response {
         headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
         headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     }
+    s.stats.record(&method, &path, res.status().as_u16(), s.public.is_some());
     tracing::info!("{method} {path} {} {}ms", res.status().as_u16(), started.elapsed().as_millis());
     res
 }

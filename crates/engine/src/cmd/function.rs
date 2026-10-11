@@ -23,12 +23,17 @@ pub(crate) fn functions_on(store: &Store) -> bool {
 }
 
 /// API options carrying the functions service and its internal key.
-pub(crate) fn api_options(functions: &Arc<Service>, limits: &Arc<porchly_api::Limits>) -> porchly_api::Options {
+pub(crate) fn api_options(
+    functions: &Arc<Service>,
+    limits: &Arc<porchly_api::Limits>,
+    stats: &Arc<porchly_api::Stats>,
+) -> porchly_api::Options {
     porchly_api::Options {
         functions: Some(functions.clone() as Arc<dyn porchly_api::Functions>),
         internal_token: Some(functions.token().to_owned()),
         public: None,
         limits: Some(limits.clone()),
+        stats: Some(stats.clone()),
     }
 }
 

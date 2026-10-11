@@ -32,7 +32,7 @@
 
 ## What is Porchly?
 
-Porchly is a small app that gives you a **database** and a **live API** (a way for other apps to read and change your data) in one double-click. You make tables that look like a spreadsheet; each one is instantly available to your website, phone app, spreadsheet script or AI agent. When you want it reachable from anywhere, turn on the **porch light** and you get a public link.
+Porchly is a small app that gives you a **database** and a **live API** (a way for other apps to read and change your data) in one double-click. You make tables that look like a spreadsheet; each one is instantly available to your website, phone app, spreadsheet script or AI assistant. When you want it reachable from anywhere, turn on the **porch light** and you get a public link.
 
 Things people build with it:
 - a sign-up sheet that a club's website fills in
@@ -64,9 +64,12 @@ Type straight into the grid. Fields can be text, numbers, yes/no, dates, or **li
 Every table is a REST API at `/api/<table>`: list, filter (`?minutes=lt.30`), sort, search, follow links (`?expand=customer`), add, change and delete. Every project comes with a readable guide at `/docs` and a machine-readable description at `/api/openapi.json`, so tools and AI agents can use it without help.
 
 ### The porch light: a public link
-One click gives your API an `https://…trycloudflare.com` address that works from anywhere, with no router settings or account. Porchly explains what that means before it turns on, and links are **read-only unless you allow changes**.
+One click gives your API an `https://…trycloudflare.com` address that works from anywhere, with no router settings or account. Have a domain? Use your own address that never changes. Porchly explains what that means before it turns on, and links are **read-only unless you allow changes**.
 
 <p align="center"><img src="assets/screenshots/porch-light.png" alt="The warning shown before the porch light turns on" width="760"></p>
+
+### Works with AI assistants
+Connect Claude, Cursor or another assistant ([MCP](docs/mcp.md)) and ask in plain words: "add these three orders", "who hasn't paid?". A read-only key lets it look; a key that may make changes lets it add, change and delete rows, and anything it changes can be undone.
 
 ### Functions: your own code behind the API
 Need to send an email when an order comes in, or accept a webhook from Stripe? Write a small JavaScript or TypeScript function and it's live at `/api/fn/<name>`. Functions are off until you turn them on; Porchly then downloads [Bun](https://bun.sh) once to run them. Try them right in the app.
@@ -83,7 +86,9 @@ It follows your system.
 - **Every request needs a key.** Keys can only read unless you say otherwise, and you can turn any key off. Porchly shows a key once and keeps only its fingerprint.
 - **Through the public link, apps can only read** unless you tick "Allow changes".
 - **Requests are rate-limited** (you choose how many per second in Settings) and size-limited.
-- **Before deleting a table or a field, or changing a field's type, Porchly saves a snapshot** of your project.
+- **Mistakes can be undone.** Changed or deleted rows can be brought back for a week, whoever changed them: you, an app or an AI assistant.
+- **A backup every day**, and a snapshot before a table or field is deleted. Going back is one click, and can itself be undone. See [Backups and undo](docs/backups.md).
+- **See who's using it.** Stats shows requests per key and per table, and how many were refused. The numbers stay on your computer.
 - **No administrator rights, no background service, no telemetry.**
 
 ## Your data stays yours
@@ -95,7 +100,7 @@ Porchly is portable. Your tables live in one file in a **Porchly data** folder n
 
 **Do I need an account or the internet?** No account at all. The internet is only needed for the porch light and, once, to download the helpers for the porch light and functions.
 
-**Is the public link permanent?** Not yet. It changes every time you turn the light on, and Cloudflare's free links are meant for trying things out. A permanent address is planned.
+**Is the public link permanent?** The free link changes every time you turn the light on. If you have a domain, you can use [your own address](docs/porch-light.md#your-own-address-stays-the-same), which stays the same.
 
 **Can several people edit at once?** Yes, through the API: every app with a key reads and writes the same tables.
 
@@ -105,7 +110,7 @@ Porchly is portable. Your tables live in one file in a **Porchly data** folder n
 
 ## For developers
 Building from source, running the tests and how the code is organised: [CONTRIBUTING.md](CONTRIBUTING.md). Reference documentation:
-[API](docs/api.md) · [Functions](docs/functions.md) · [Porch light](docs/porch-light.md) · [Settings](docs/settings.md) · [Command line](docs/cli.md) · [Remote control](docs/control-protocol.md)
+[API](docs/api.md) · [AI assistants (MCP)](docs/mcp.md) · [Functions](docs/functions.md) · [Porch light](docs/porch-light.md) · [Settings](docs/settings.md) · [Command line](docs/cli.md) · [Remote control](docs/control-protocol.md)
 
 Porchly is written in Rust, with [egui](https://github.com/emilk/egui) for the window, [axum](https://github.com/tokio-rs/axum) for the API and SQLite for storage.
 

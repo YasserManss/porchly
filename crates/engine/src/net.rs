@@ -20,6 +20,8 @@ pub(crate) struct Net {
     state: Mutex<State>,
     /// The rate limit both servers use; Settings change it while they run.
     limits: Arc<porchly_api::Limits>,
+    /// Usage numbers, counted by both servers together and kept across restarts of them.
+    stats: Arc<porchly_api::Stats>,
 }
 
 #[derive(Default)]
@@ -39,7 +41,16 @@ struct Server {
 
 impl Net {
     pub(crate) fn new(allowed: bool) -> Self {
-        Net { allowed, state: Mutex::new(State::default()), limits: Arc::new(porchly_api::Limits::default()) }
+        Net {
+            allowed,
+            state: Mutex::new(State::default()),
+            limits: Arc::new(porchly_api::Limits::default()),
+            stats: Arc::new(porchly_api::Stats::default()),
+        }
+    }
+
+    pub(crate) fn stats(&self) -> &Arc<porchly_api::Stats> {
+        &self.stats
     }
 
     pub(crate) fn limits(&self) -> &Arc<porchly_api::Limits> {
@@ -61,7 +72,7 @@ impl Net {
             return Ok(status_of(state.server.as_ref()));
         }
         let listener = porchly_api::bind(IpAddr::V4(Ipv4Addr::LOCALHOST), port, exact)?;
-        let options = crate::cmd::api_options(functions, &self.limits);
+        let options = crate::cmd::api_options(functions, &self.limits, &self.stats);
         let server = spawn(&mut state, store, listener, options)?;
         functions.set_api_url(Some(format!("http://{}", server.addr)));
         state.server = Some(server);
@@ -82,27 +93,41 @@ impl Net {
         status_of(state.server.as_ref())
     }
 
-    /// Starts the copy of the API behind the public link, on a free port. Returns the port.
+    /// Starts the copy of the API behind the public link. `port` 0 means any free port (a
+    /// quick tunnel is told which); a stable address is set up in Cloudflare to point at one
+    /// fixed port, so that one must be exactly `port`. Returns the port.
     pub(crate) fn start_public(
         &self,
         store: &Shared,
         functions: &Arc<Service>,
         allow_changes: &Arc<AtomicBool>,
+        port: u16,
     ) -> Result<u16> {
         if !self.allowed {
             return Err(Error::invalid("The porch light can't be turned on in this mode."));
         }
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(s) = state.public.as_ref().filter(|s| s.running()) {
+        if let Some(s) = state.public.as_ref().filter(|s| s.running() && (port == 0 || s.addr.port() == port)) {
             return Ok(s.addr.port());
         }
-        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .map_err(|e| Error::invalid(format!("Couldn't open a port for the porch light: {e}")))?;
+        if let Some(mut old) = state.public.take() {
+            old.shut();
+        }
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).map_err(|e| {
+            if port == 0 {
+                Error::invalid(format!("Couldn't open a port for the porch light: {e}"))
+            } else {
+                Error::invalid(format!(
+                    "Port {port}, which your stable address uses, is taken by another program on this computer ({e}). Close that program and try again."
+                ))
+            }
+        })?;
         let options = porchly_api::Options {
             functions: Some(functions.clone() as Arc<dyn porchly_api::Functions>),
             internal_token: None,
             public: Some(allow_changes.clone()),
             limits: Some(self.limits.clone()),
+            stats: Some(self.stats.clone()),
         };
         let server = spawn(&mut state, store, listener, options)?;
         let port = server.addr.port();

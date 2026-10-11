@@ -68,6 +68,14 @@ pub(crate) fn spec(tables: &[TableDef], functions: &[FnSummary]) -> Value {
                 )
             }));
         }
+        // Bulk changes take the conditions of a list, but none of its paging.
+        let mut bulk_params = vec![
+            query_param("id", json!({ "type": "string" }), "Rows by id, for example in.1,2,3."),
+            query_param("search", json!({ "type": "string" }), "Rows with this text in any text field."),
+        ];
+        for f in &t.fields {
+            bulk_params.push(query_param(f.name.as_str(), json!({ "type": "string" }), FILTER_HELP));
+        }
         paths.insert(
             format!("/api/{name}"),
             json!({
@@ -82,9 +90,34 @@ pub(crate) fn spec(tables: &[TableDef], functions: &[FnSummary]) -> Value {
                     }
                 },
                 "post": {
-                    "summary": format!("Add a row to {name}"),
+                    "summary": format!("Add a row to {name}, or several"),
+                    "description": format!("Send one row, or a list of up to {} rows. A list is all or nothing: if one row is refused, none are added and the error names the row. A list answers with {{count, items}}.", limits::MAX_BULK_ROWS),
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": {
+                        "oneOf": [row_ref, { "type": "array", "items": row_ref, "maxItems": limits::MAX_BULK_ROWS }] } } } },
+                    "responses": {
+                        "201": ok(json!({ "oneOf": [row_ref, { "type": "object", "properties": {
+                            "count": { "type": "integer" }, "items": { "type": "array", "items": row_ref } } }] })),
+                        "default": error()
+                    }
+                },
+                "patch": {
+                    "summary": format!("Change every row of {name} that matches"),
+                    "description": "Every row matching the conditions gets the fields sent. At least one condition is required (for example id=in.1,2,3); limit, offset, sort and expand aren't allowed.",
+                    "parameters": bulk_params.clone(),
                     "requestBody": { "required": true, "content": { "application/json": { "schema": row_ref } } },
-                    "responses": { "201": ok(row_ref.clone()), "default": error() }
+                    "responses": {
+                        "200": ok(json!({ "type": "object", "properties": { "updated": { "type": "integer" } } })),
+                        "default": error()
+                    }
+                },
+                "delete": {
+                    "summary": format!("Delete every row of {name} that matches"),
+                    "description": "Every row matching the conditions is deleted; links to them are cleared. At least one condition is required (for example id=in.1,2,3); limit, offset, sort and expand aren't allowed.",
+                    "parameters": bulk_params,
+                    "responses": {
+                        "200": ok(json!({ "type": "object", "properties": { "deleted": { "type": "integer" } } })),
+                        "default": error()
+                    }
                 }
             }),
         );

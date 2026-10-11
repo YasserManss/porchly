@@ -7,7 +7,7 @@
 | **M2 Plugins** | WASM plugin host (wasmtime), the plugin interface (WIT v1), custom endpoints built from blocks, a webhook plugin | Planned |
 | **M3 Automations** | "When a row is added → send an email" rules, email (SMTP) and notification (ntfy) plugins | Planned |
 | **M4 External data** | Postgres and MySQL tables, REST APIs as data sources | Planned |
-| **M5 Ecosystem** | Plugin registry, signed plugins, plugin template, MCP server for AI agents | Planned |
+| **M5 Ecosystem** | Plugin registry, signed plugins, plugin template | Planned |
 
 ## M0 — Core ✅
 - [x] M0.0 Workspace, lints, `cargo xtask ci` (fmt, clippy, tests, assets, layers)
@@ -37,6 +37,11 @@
   - [x] M1.11d Logs, test panel, commands, docs
 - [x] M1.4 Porch light: Cloudflare quick tunnel, status, read-only by default
 - [x] M1.12 Settings: requests per app, function time limit, port, start the API on open
+- [x] M1.17 Stats: requests, rows and size at a glance; activity in the last hour; use per key, table and function; updates by itself
+- [x] M1.16 Your own address: a stable public link through your own Cloudflare tunnel; its token kept in the system keychain
+- [x] M1.15 AI assistants (MCP): `/mcp` with the same keys, `porchly-cli mcp`, tools for rows (and tables when allowed), "Connect an AI assistant" in Share
+- [x] M1.14 Backups and undo: row changes and deletes can be undone for a week; a backup every day (with the functions' code); going back to a backup or snapshot in one click
+- [x] M1.13 Many rows at once: add a list of rows (all or nothing), change or delete every row matching conditions; tick rows in the app and delete them together
 - [x] M1.5 Control channel (token-protected, 127.0.0.1) and screenshots; offscreen screenshots
 - [x] M1.6 CSV import/export (preview with type guesses, all-or-nothing, drag a file onto the window)
 - [x] M1.7 Sample project and first-run welcome

@@ -43,3 +43,11 @@ pub const MAX_FUNCTION_CODE_BYTES: usize = 1024 * 1024;
 pub const MAX_FUNCTIONS: usize = 500;
 /// Most variables one function can have.
 pub const MAX_FUNCTION_VARS: usize = 100;
+/// Most rows added by one bulk request to the API.
+pub const MAX_BULK_ROWS: usize = 1_000;
+/// Changes kept for undo; older ones are forgotten.
+pub const MAX_UNDO_OPS: i64 = 200;
+/// Days a change can be undone for.
+pub const UNDO_DAYS: u32 = 7;
+/// Daily backups kept per project.
+pub const MAX_DAILY_BACKUPS: usize = 7;

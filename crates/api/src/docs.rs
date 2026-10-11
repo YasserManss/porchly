@@ -65,7 +65,7 @@ pub fn html(tables: &[TableDef], functions: &[FnSummary], base: &str) -> String 
 <tr><td>413</td><td><code>too_large</code></td><td>The request is too big.</td></tr>
 <tr><td>429</td><td><code>rate_limited</code></td><td>Too many requests with one key; slow down.</td></tr>
 </table>
-<p class="foot">Tools can read a machine-readable description at <code>{base}/api/openapi.json</code>.</p>
+<p class="foot">Tools can read a machine-readable description at <code>{base}/api/openapi.json</code>. AI assistants can connect with MCP at <code>{base}/mcp</code>, using a key.</p>
 </main></body></html>"#
     )
 }
@@ -128,6 +128,13 @@ fn table_section(t: &TableDef, base: &str) -> String {
 <pre>curl -X PATCH -H "Authorization: Bearer YOUR_KEY" \
   -d '{example}' {base}/api/{name}/1</pre>
 <h4>Delete a row</h4><pre>curl -X DELETE -H "Authorization: Bearer YOUR_KEY" {base}/api/{name}/1</pre>
+<h4>Many rows at once</h4>
+<p>Send a list to add several rows: all are added, or none. To change or delete many rows, add <a href='#lists'>conditions</a> to the address; every matching row is affected, and a request without a condition is refused.</p>
+<pre>curl -X POST -H "Authorization: Bearer YOUR_KEY" \
+  -d '[{example}, {example}]' {base}/api/{name}
+curl -X PATCH -H "Authorization: Bearer YOUR_KEY" \
+  -d '{example}' "{base}/api/{name}?id=in.1,2,3"
+curl -X DELETE -H "Authorization: Bearer YOUR_KEY" "{base}/api/{name}?id=in.1,2,3"</pre>
 </section>"#
     )
 }
@@ -196,6 +203,7 @@ mod tests {
         assert!(page.contains("<code>item</code></td><td>Text</td><td>Required"));
         assert!(page.contains("The id of a row in <a href=\"#t-customers\">customers</a>"));
         assert!(page.contains("http://127.0.0.1:11911/api/orders/1"), "no double slash");
+        assert!(page.contains("http://127.0.0.1:11911/api/orders?id=in.1,2,3"), "bulk examples");
         assert!(!page.contains("<script"));
         assert!(!page.contains("id=\"functions\""), "no functions, no section");
     }

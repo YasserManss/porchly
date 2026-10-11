@@ -243,6 +243,7 @@ fn with_functions(store: porchly_store::Shared) -> axum::Router {
         internal_token: Some(INTERNAL.to_owned()),
         public: None,
         limits: None,
+        stats: None,
     };
     porchly_api::router_with(store, options)
 }
@@ -313,6 +314,7 @@ fn public_link(
             internal_token: Some(INTERNAL.to_owned()),
             public: Some(allow),
             limits: None,
+            stats: None,
         };
         porchly_api::router_with(store, options)
     }
@@ -378,4 +380,140 @@ async fn the_request_limit_follows_settings_at_once() {
     assert_eq!(body["error"]["code"], "rate_limited");
     limits.set_per_second(0);
     assert_eq!(limits.per_second(), 1, "the limit can't be turned off");
+}
+
+#[tokio::test]
+async fn bulk_changes_need_a_write_key_and_a_condition() {
+    let a = app();
+    a.post("/api/recipes", r#"[{"name":"Soup"},{"name":"Salad"}]"#).await;
+    let (read, write) = (a.read_key.clone(), a.write_key.clone());
+
+    // Read-only keys and missing keys can't change or delete anything.
+    for key in [Some(read.as_str()), None] {
+        let expected = if key.is_some() { StatusCode::FORBIDDEN } else { StatusCode::UNAUTHORIZED };
+        assert_eq!(a.send(Method::POST, "/api/recipes", key, Some(r#"[{"name":"x"}]"#)).await.0, expected);
+        assert_eq!(a.send(Method::PATCH, "/api/recipes?id=gte.1", key, Some(r#"{"name":"x"}"#)).await.0, expected);
+        assert_eq!(a.send(Method::DELETE, "/api/recipes?id=gte.1", key, None).await.0, expected);
+    }
+
+    // A forgotten condition never touches the whole table.
+    let (status, body) = a.send(Method::DELETE, "/api/recipes", Some(&write), None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"]["message"].as_str().unwrap().contains("Say which rows to delete"), "{body}");
+    let (status, _) = a.send(Method::PATCH, "/api/recipes", Some(&write), Some(r#"{"name":"x"}"#)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // Paging would suggest only some rows are affected: refused.
+    assert_eq!(a.send(Method::DELETE, "/api/recipes?limit=1", Some(&write), None).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        a.send(Method::DELETE, "/api/recipes?id=gte.1&limit=1", Some(&write), None).await.0,
+        StatusCode::BAD_REQUEST
+    );
+    // Unknown fields and hostile conditions are refused, not ignored.
+    assert_eq!(a.send(Method::DELETE, "/api/recipes?nope=1", Some(&write), None).await.0, StatusCode::BAD_REQUEST);
+    let hostile = "/api/recipes?name=x%27%20OR%201%3D1%20--";
+    assert_eq!(
+        a.send(Method::DELETE, hostile, Some(&write), None).await.1["deleted"],
+        0,
+        "bound as a value, never SQL"
+    );
+    assert_eq!(a.row_count(), 2, "nothing was deleted or changed");
+
+    // Too many rows in one request.
+    let many = format!("[{}]", vec![r#"{"name":"x"}"#; limits::MAX_BULK_ROWS + 1].join(","));
+    assert_eq!(a.post("/api/recipes", &many).await.0, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(a.row_count(), 2);
+}
+
+#[tokio::test]
+async fn bulk_changes_are_refused_through_a_read_only_public_link() {
+    let allow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let a = app_with(public_link(allow));
+    let write = a.write_key.clone();
+    assert_eq!(
+        a.send(Method::POST, "/api/recipes", Some(&write), Some(r#"[{"name":"x"}]"#)).await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        a.send(Method::PATCH, "/api/recipes?id=gte.1", Some(&write), Some(r#"{"name":"x"}"#)).await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(a.send(Method::DELETE, "/api/recipes?id=gte.1", Some(&write), None).await.0, StatusCode::FORBIDDEN);
+}
+
+/// Sends one MCP message; returns the status and the answer.
+async fn mcp(a: &common::App, key: Option<&str>, message: serde_json::Value) -> (StatusCode, serde_json::Value) {
+    a.send(Method::POST, "/mcp", key, Some(&message.to_string())).await
+}
+
+fn tool_names(answer: &serde_json::Value) -> Vec<String> {
+    answer["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_owned()).collect()
+}
+
+#[tokio::test]
+async fn ai_assistants_get_only_what_their_key_allows() {
+    use serde_json::json;
+    let a = app();
+    a.post("/api/recipes", r#"[{"name":"Soup"},{"name":"Salad"}]"#).await;
+    let (read, write) = (a.read_key.clone(), a.write_key.clone());
+    let list = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+    let delete = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": "delete_rows", "arguments": {"table": "recipes", "ids": [1]}}});
+
+    // No key, or a wrong one: nothing at all, not even the list of tools.
+    assert_eq!(mcp(&a, None, list.clone()).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(mcp(&a, Some("pk_wrong"), list.clone()).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(a.send(Method::GET, "/mcp", Some(&read), None).await.0, StatusCode::METHOD_NOT_ALLOWED);
+
+    // A read-only key reads, and isn't even offered the tools that change things.
+    let (status, answer) = mcp(&a, Some(&read), list.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(tool_names(&answer), ["list_tables", "list_rows", "get_row"]);
+    let (_, answer) = mcp(&a, Some(&read), delete.clone()).await;
+    assert_eq!(answer["result"]["isError"], true, "calling it anyway is refused");
+    assert_eq!(a.row_count(), 2);
+
+    // A key that may make changes can; making tables stays off until the owner allows it.
+    let (_, answer) = mcp(&a, Some(&write), list.clone()).await;
+    let names = tool_names(&answer);
+    assert!(names.contains(&"delete_rows".to_owned()) && !names.contains(&"create_table".to_owned()));
+    let (_, answer) = mcp(&a, Some(&write), delete.clone()).await;
+    assert_eq!(answer["result"]["isError"], false);
+    assert_eq!(a.row_count(), 1);
+    lock(&a.store).set_setting(porchly_api::mcp::TABLES_SETTING, Some("on")).unwrap();
+    let (_, answer) = mcp(&a, Some(&write), list.clone()).await;
+    assert!(tool_names(&answer).contains(&"create_table".to_owned()));
+    let (_, answer) = mcp(&a, Some(&read), list).await;
+    assert_eq!(tool_names(&answer).len(), 3, "never for a read-only key");
+
+    // Notifications are accepted without an answer; junk is refused politely.
+    let (status, body) = mcp(&a, Some(&read), json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).await;
+    assert_eq!((status, body), (StatusCode::ACCEPTED, serde_json::Value::Null));
+    assert_eq!(a.send(Method::POST, "/mcp", Some(&read), Some("{not json")).await.0, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn ai_assistants_can_only_read_through_a_read_only_public_link() {
+    use serde_json::json;
+    let allow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let a = app_with(public_link(allow.clone()));
+    lock(&a.store).set_setting(porchly_api::mcp::TABLES_SETTING, Some("on")).unwrap();
+    let write = a.write_key.clone();
+    let list = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+    let add = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": "add_rows", "arguments": {"table": "recipes", "rows": [{"name": "x"}]}}});
+    let (_, answer) = mcp(&a, Some(&write), list.clone()).await;
+    assert_eq!(tool_names(&answer), ["list_tables", "list_rows", "get_row"], "even a key that may make changes");
+    let (_, answer) = mcp(&a, Some(&write), add.clone()).await;
+    assert_eq!(answer["result"]["isError"], true);
+    assert_eq!(a.row_count(), 0);
+    assert_eq!(
+        mcp(&a, Some(INTERNAL), list.clone()).await.0,
+        StatusCode::UNAUTHORIZED,
+        "the functions' key doesn't work here"
+    );
+
+    allow.store(true, std::sync::atomic::Ordering::Relaxed);
+    let (_, answer) = mcp(&a, Some(&write), add).await;
+    assert_eq!(answer["result"]["isError"], false, "once the owner allows changes through the link");
+    assert_eq!(a.row_count(), 1);
 }

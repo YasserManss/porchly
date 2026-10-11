@@ -31,6 +31,11 @@ pub enum Dialog {
         table: String,
         id: i64,
     },
+    /// Delete the rows ticked in the grid.
+    DeleteRows {
+        table: String,
+        ids: Vec<i64>,
+    },
     DeleteTable {
         table: String,
     },
@@ -49,6 +54,30 @@ pub enum Dialog {
         new_label: String,
         existing: Option<String>,
     },
+    /// How to connect an AI assistant (MCP): what to paste where.
+    ConnectAi {
+        /// Snippets to copy: (who it's for, the text).
+        snippets: Vec<(String, String)>,
+        /// The snippet just copied, to say so.
+        copied: Option<usize>,
+    },
+    /// Usage numbers (from `stats.get`). The app refreshes `data` while it's open.
+    Stats {
+        data: serde_json::Value,
+    },
+    /// Recent changes (undo) and backups (restore).
+    Backups {
+        changes: Vec<ChangeItem>,
+        points: Vec<PointItem>,
+        /// What was just clicked, carried out when the dialog confirms.
+        pending: Option<BackupAction>,
+    },
+    /// Asks before going back to a backup.
+    Restore {
+        name: String,
+        label: String,
+        when: String,
+    },
     /// A few plain settings.
     Settings {
         /// Requests per second, per app, as typed.
@@ -56,11 +85,24 @@ pub enum Dialog {
         function_timeout: u64,
         port: String,
         start_api: bool,
+        /// AI assistants may make tables and fields.
+        ai_tables: bool,
         /// Whether to show the functions' time limit.
         functions_on: bool,
     },
     /// Explains the porch light before turning it on.
+    /// Set up a stable address: the token of the owner's own Cloudflare tunnel.
+    OwnAddress {
+        /// What was pasted (shown as dots).
+        token: String,
+        has_token: bool,
+        /// Where the tunnel must send visitors.
+        service: String,
+    },
     PorchLight {
+        /// Use the owner's own address (only offered when a token is saved).
+        own: bool,
+        has_token: bool,
         allow_changes: bool,
         /// Whether some functions may be run by anyone (then the warning says so).
         public_functions: bool,
@@ -94,6 +136,29 @@ pub enum Dialog {
         required: bool,
         links_to: Option<String>,
     },
+}
+
+/// A recent change that can be undone.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChangeItem {
+    pub id: i64,
+    pub when: String,
+    pub summary: String,
+    pub undone: bool,
+}
+
+/// A backup that can be restored.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PointItem {
+    pub name: String,
+    pub label: String,
+    pub when: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum BackupAction {
+    Undo(i64),
+    BackupNow,
 }
 
 /// A column of a file being imported.
@@ -171,6 +236,35 @@ impl Dialog {
         Dialog::NewKey { name: String::new(), can_write: false }
     }
 
+    /// The Backups window, from `undo.list` and `backup.list`.
+    pub fn backups(changes: &serde_json::Value, points: &serde_json::Value) -> Self {
+        let text = |v: &serde_json::Value, k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or_default().to_owned();
+        let changes = changes
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|c| {
+                        Some(ChangeItem {
+                            id: c.get("id")?.as_i64()?,
+                            when: text(c, "at_local"),
+                            summary: text(c, "summary"),
+                            undone: c.get("undone").and_then(|u| u.as_bool()).unwrap_or(false),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let points = points
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|p| PointItem { name: text(p, "name"), label: text(p, "label"), when: text(p, "at") })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Dialog::Backups { changes, points, pending: None }
+    }
+
     /// The Settings dialog, filled in from `settings.get`.
     pub fn settings(current: &serde_json::Value, functions_on: bool) -> Self {
         Dialog::Settings {
@@ -178,6 +272,7 @@ impl Dialog {
             function_timeout: current.get("function_timeout").and_then(|v| v.as_u64()).unwrap_or(0),
             port: current.get("port").and_then(|v| v.as_u64()).unwrap_or(11911).to_string(),
             start_api: current.get("start_api").and_then(|v| v.as_bool()).unwrap_or(true),
+            ai_tables: current.get("ai_can_make_tables").and_then(|v| v.as_bool()).unwrap_or(false),
             functions_on,
         }
     }
@@ -216,7 +311,12 @@ pub(crate) fn show(app: &mut PorchlyApp, ctx: &egui::Context) {
         .show(ctx, |ui| {
             ui.set_width(match dialog {
                 Dialog::ImportCsv { .. } => 680.0,
-                Dialog::FunctionsOptIn { .. } | Dialog::PorchLight { .. } => 460.0,
+                Dialog::FunctionsOptIn { .. }
+                | Dialog::PorchLight { .. }
+                | Dialog::Restore { .. }
+                | Dialog::OwnAddress { .. } => 460.0,
+                Dialog::Backups { .. } | Dialog::ConnectAi { .. } => 560.0,
+                Dialog::Stats { .. } => 640.0,
                 _ => 400.0,
             });
             outcome = body(&mut dialog, ui, &t, &tables, error.as_deref());
@@ -398,7 +498,170 @@ fn fields(
             let ready = if *into_new { to_ident(new_label).is_some() } else { existing.is_some() };
             buttons(ui, "Import", false, ready, enter)
         }
-        Dialog::Settings { rate, function_timeout, port, start_api, functions_on } => {
+        Dialog::Stats { data } => {
+            title(ui, "Stats");
+            egui::ScrollArea::vertical().max_height(560.0).auto_shrink([false, true]).show(ui, |ui| {
+                crate::stats_view::show(ui, t, data);
+            });
+            ui.add_space(12.0);
+            let mut outcome = Outcome::Keep;
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if icons::button(ui, None, "Close", true).clicked() {
+                    outcome = Outcome::Cancel;
+                }
+            });
+            outcome
+        }
+        Dialog::Backups { changes, points, pending } => {
+            title(ui, "Backups");
+            let mut outcome = Outcome::Keep;
+            ui.label(RichText::new("Recent changes").strong());
+            ui.label(
+                RichText::new("Rows changed or deleted in the last 7 days, by you or by apps. Undo puts them back the way they were.")
+                    .small()
+                    .color(t.text_dim),
+            );
+            egui::ScrollArea::vertical().id_salt("changes").max_height(170.0).auto_shrink([false, true]).show(
+                ui,
+                |ui| {
+                    if changes.is_empty() {
+                        ui.label(RichText::new("Nothing has been changed or deleted yet.").color(t.text_dim));
+                    }
+                    for c in changes.iter() {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(&c.when).small().color(t.text_dim));
+                            ui.label(&c.summary);
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if c.undone {
+                                    ui.label(RichText::new("Undone").small().color(t.text_dim));
+                                } else if ui
+                                    .small_button("Undo")
+                                    .on_hover_text(format!("Undo: {}", c.summary))
+                                    .clicked()
+                                {
+                                    *pending = Some(BackupAction::Undo(c.id));
+                                    outcome = Outcome::Confirm;
+                                }
+                            });
+                        });
+                    }
+                },
+            );
+            ui.add_space(12.0);
+            ui.label(RichText::new("Backups").strong());
+            ui.label(
+                RichText::new("Porchly makes one every day, and before a table or field is deleted. Going back puts everything as it was then.")
+                    .small()
+                    .color(t.text_dim),
+            );
+            egui::ScrollArea::vertical().id_salt("points").max_height(170.0).auto_shrink([false, true]).show(
+                ui,
+                |ui| {
+                    if points.is_empty() {
+                        ui.label(RichText::new("No backups yet. The first is made today.").color(t.text_dim));
+                    }
+                    for p in points.iter() {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(&p.when).small().color(t.text_dim));
+                            ui.label(&p.label);
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui
+                                    .small_button("Go back\u{2026}")
+                                    .on_hover_text(format!("Go back to: {}, {}", p.label, p.when))
+                                    .clicked()
+                                {
+                                    outcome = Outcome::Replace(Box::new(Dialog::Restore {
+                                        name: p.name.clone(),
+                                        label: p.label.clone(),
+                                        when: p.when.clone(),
+                                    }));
+                                }
+                            });
+                        });
+                    }
+                },
+            );
+            show_error(ui, t, error);
+            ui.add_space(16.0);
+            ui.horizontal(|ui| {
+                if icons::button(ui, None, "Back up now", false).clicked() {
+                    *pending = Some(BackupAction::BackupNow);
+                    outcome = Outcome::Confirm;
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if icons::button(ui, None, "Close", true).clicked() {
+                        outcome = Outcome::Cancel;
+                    }
+                });
+            });
+            outcome
+        }
+        Dialog::Restore { label, when, .. } => {
+            title(ui, "Go back to this backup?");
+            ui.label(RichText::new(format!("{label}, {when}")).strong());
+            ui.add_space(6.0);
+            ui.label(
+                "Your tables, rows and functions will be as they were then. Everything changed since is replaced.",
+            );
+            ui.add_space(6.0);
+            ui.label("Porchly first saves the way things are now as a backup, so you can come back to it. Your keys and settings stay as they are today.");
+            show_error(ui, t, error);
+            buttons(ui, "Go back to this backup", true, true, false)
+        }
+        Dialog::ConnectAi { snippets, copied } => {
+            title(ui, "Connect an AI assistant");
+            ui.label("Assistants like Claude, Cursor and VS Code can look things up in your tables and change them for you. Each one needs a key, like any app.");
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("A key that can only read lets the assistant look. A key that may make changes also lets it add, change and delete rows; you can undo those under Backups.")
+                    .small()
+                    .color(t.text_dim),
+            );
+            egui::ScrollArea::vertical().max_height(360.0).auto_shrink([false, true]).show(ui, |ui| {
+                for (i, (who, text)) in snippets.iter().enumerate() {
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(who).strong());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("Copy").on_hover_text(format!("Copy: {who}")).clicked() {
+                                ui.ctx().copy_text(text.clone());
+                                *copied = Some(i);
+                            }
+                            if *copied == Some(i) {
+                                ui.label(RichText::new("Copied").small().color(t.ok));
+                            }
+                        });
+                    });
+                    egui::Frame::NONE
+                        .fill(t.row_alt)
+                        .stroke(egui::Stroke::new(1.0, t.border))
+                        .corner_radius(6)
+                        .inner_margin(8)
+                        .show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.add(egui::Label::new(RichText::new(text).monospace().size(12.5)).wrap());
+                        });
+                }
+            });
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new("Replace YOUR_KEY with a key from the Keys list in Share. An assistant that starts a program can only read, unless you add \"--write\" after \"mcp\". Assistants are told that rows are data, not instructions, but take care with tables strangers can write to.")
+                    .small()
+                    .color(t.text_dim),
+            );
+            ui.add_space(12.0);
+            let mut outcome = Outcome::Keep;
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if icons::button(ui, None, "Close", true).clicked() {
+                    outcome = Outcome::Cancel;
+                }
+                if icons::button(ui, None, "New key", false).clicked() {
+                    outcome = Outcome::Replace(Box::new(Dialog::new_key()));
+                }
+            });
+            outcome
+        }
+        Dialog::Settings { rate, function_timeout, port, start_api, ai_tables, functions_on } => {
             title(ui, "Settings");
             ui.label(RichText::new("Requests per second, per app").strong());
             ui.add(egui::TextEdit::singleline(rate).desired_width(90.0));
@@ -442,12 +705,91 @@ fn fields(
             ui.label(RichText::new(note).small().color(if port_ok { t.text_dim } else { t.danger }));
             ui.add_space(10.0);
             ui.checkbox(start_api, "Turn on the API when Porchly opens");
+            ui.add_space(6.0);
+            ui.checkbox(ai_tables, "Let AI assistants make new tables and fields");
+            ui.label(
+                RichText::new("Off: connected assistants can only work with the rows of tables you made. They can never delete a table either way.")
+                    .small()
+                    .color(t.text_dim),
+            );
             show_error(ui, t, error);
             buttons(ui, "Save", false, port_ok && rate_ok, enter)
         }
-        Dialog::PorchLight { allow_changes, public_functions } => {
+        Dialog::OwnAddress { token, has_token, service } => {
+            title(ui, "Your own address");
+            ui.label("An address that stays the same, like https://api.yourname.com. It needs a domain of yours on a free Cloudflare account. You set it up once:");
+            ui.add_space(8.0);
+            let step = |ui: &mut Ui, n: &str, text: &str| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(n).strong().color(t.accent));
+                    ui.label(text);
+                });
+            };
+            step(ui, "1.", "In Cloudflare, open Zero Trust, then Networks, then Tunnels, and create a tunnel.");
+            step(ui, "2.", "Give the tunnel a public hostname (the address you want), and as its service enter:");
+            ui.horizontal(|ui| {
+                ui.add_space(18.0);
+                ui.label(RichText::new(service.as_str()).monospace());
+                if icons::icon_button(ui, icons::Icon::Copy, "Copy the service address").clicked() {
+                    ui.ctx().copy_text(service.clone());
+                }
+            });
+            step(
+                ui,
+                "3.",
+                "Copy the tunnel's token from Cloudflare (or the whole command it shows) and paste it here:",
+            );
+            let field = ui.add(
+                egui::TextEdit::singleline(token)
+                    .password(true)
+                    .hint_text(if *has_token {
+                        "A token is saved. Paste a new one to replace it."
+                    } else {
+                        "Paste the token"
+                    })
+                    .desired_width(f32::INFINITY),
+            );
+            focus_first(ui, &field);
+            ui.label(
+                RichText::new("The token is kept in this computer's keychain, never in your project or its backups.")
+                    .small()
+                    .color(t.text_dim),
+            );
+            show_error(ui, t, error);
+            ui.add_space(16.0);
+            let mut outcome = Outcome::Keep;
+            ui.horizontal(|ui| {
+                if *has_token && icons::button(ui, None, "Forget the token", false).clicked() {
+                    token.clear();
+                    outcome = Outcome::Confirm;
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let can_save = !token.trim().is_empty();
+                    if ui.add_enabled_ui(can_save, |ui| icons::button(ui, None, "Save", true)).inner.clicked()
+                        || (enter && can_save)
+                    {
+                        outcome = Outcome::Confirm;
+                    }
+                    if icons::button(ui, None, "Cancel", false).clicked() {
+                        outcome = Outcome::Cancel;
+                    }
+                });
+            });
+            outcome
+        }
+        Dialog::PorchLight { own, has_token, allow_changes, public_functions } => {
             title(ui, "Turn on the porch light?");
-            ui.label("Your API gets a public address on the internet, like https://\u{2026}.trycloudflare.com. Then apps and websites anywhere can reach it, not just this computer.");
+            if *has_token {
+                ui.radio_value(own, true, "At your own address (stays the same)");
+                ui.radio_value(own, false, "With a temporary link (changes every time)");
+                ui.add_space(6.0);
+            }
+            let what = if *own {
+                "Your API becomes reachable at your own address. Then apps and websites anywhere can reach it, not just this computer."
+            } else {
+                "Your API gets a public address on the internet, like https://\u{2026}.trycloudflare.com. Then apps and websites anywhere can reach it, not just this computer."
+            };
+            ui.label(what);
             ui.add_space(8.0);
             let point = |ui: &mut Ui, text: &str| {
                 ui.horizontal_wrapped(|ui| {
@@ -465,10 +807,12 @@ fn fields(
                     "Your functions set to \u{201c}Anyone, no key needed\u{201d} can be run by anyone on the internet.",
                 );
             }
-            point(
-                ui,
-                "The link is free, from Cloudflare. It changes every time you turn the light on, and it's meant for trying things out and sharing for a while.",
-            );
+            if !*own {
+                point(
+                    ui,
+                    "The link is free, from Cloudflare. It changes every time you turn the light on, and it's meant for trying things out and sharing for a while.",
+                );
+            }
             ui.add_space(8.0);
             ui.checkbox(allow_changes, "Allow changes through the link");
             let note = if *allow_changes {
@@ -644,8 +988,16 @@ fn fields(
         }
         Dialog::DeleteRow { id, .. } => {
             title(ui, &format!("Delete row {id}?"));
-            ui.label("The row is removed right away. This can't be undone.");
+            ui.label("The row is removed right away. You can undo this afterwards.");
             buttons(ui, "Delete row", true, true, false)
+        }
+        Dialog::DeleteRows { ids, .. } => {
+            let n = ids.len();
+            let rows = if n == 1 { "1 row".to_owned() } else { format!("{n} rows") };
+            title(ui, &format!("Delete {rows}?"));
+            ui.label("The selected rows are removed right away. You can undo this afterwards.");
+            show_error(ui, t, error);
+            buttons(ui, &format!("Delete {rows}"), true, true, false)
         }
         Dialog::DeleteTable { table } => {
             title(ui, &format!("Delete \u{201c}{}\u{201d}?", pretty(table)));
@@ -722,12 +1074,41 @@ fn confirm(app: &mut PorchlyApp, dialog: &Dialog) -> bool {
             app.info(format!("Imported {n} rows into \u{201c}{}\u{201d}.", pretty(&table)));
             true
         }
-        Dialog::Settings { rate, function_timeout, port, start_api, .. } => {
+        Dialog::Backups { pending, .. } => {
+            let ok = match pending {
+                Some(BackupAction::Undo(id)) => app.run("undo.run", json!({"id": id})).is_some(),
+                Some(BackupAction::BackupNow) => app.run("backup.create", json!({})).is_some(),
+                None => true,
+            };
+            if !ok {
+                return false;
+            }
+            app.reload_tables();
+            // Show the window again with what changed.
+            app.open_backups();
+            true
+        }
+        Dialog::Restore { name, label, when } => {
+            if app.run("backup.restore", json!({"name": name})).is_none() {
+                return false;
+            }
+            app.picked_rows.clear();
+            app.reload_functions();
+            app.reload_tables();
+            app.reload_keys();
+            app.info(format!(
+                "Went back to \u{201c}{label}\u{201d} ({when}). The way things were just now is saved under Backups."
+            ));
+            true
+        }
+        Dialog::ConnectAi { .. } | Dialog::Stats { .. } => true,
+        Dialog::Settings { rate, function_timeout, port, start_api, ai_tables, .. } => {
             let params = json!({
                 "requests_per_second": rate.trim(),
                 "function_timeout": function_timeout,
                 "port": port.trim(),
                 "start_api": start_api,
+                "ai_can_make_tables": ai_tables,
             });
             if app.run("settings.set", params).is_none() {
                 return false;
@@ -736,8 +1117,28 @@ fn confirm(app: &mut PorchlyApp, dialog: &Dialog) -> bool {
             app.info("Settings saved.");
             true
         }
-        Dialog::PorchLight { allow_changes, .. } => {
-            app.start_porch_light(*allow_changes);
+        Dialog::OwnAddress { token, .. } => {
+            if token.trim().is_empty() {
+                // "Forget the token".
+                if app.run("tunnel.token.clear", json!({})).is_none() {
+                    return false;
+                }
+                app.refresh_light();
+                app.info("The token is forgotten. The porch light will use a temporary link.");
+                return true;
+            }
+            let Some(saved) = app.run("tunnel.token.set", json!({"token": token})) else { return false };
+            app.refresh_light();
+            let lasting = saved.get("token_lasting").and_then(|v| v.as_bool()).unwrap_or(false);
+            app.info(if lasting {
+                "Saved in this computer's keychain. Turn on the porch light to use your own address."
+            } else {
+                "Saved until Porchly closes: this computer has no keychain, so you'll need to paste the token again next time."
+            });
+            true
+        }
+        Dialog::PorchLight { allow_changes, own, .. } => {
+            app.start_porch_light(*allow_changes, *own);
             true
         }
         Dialog::FunctionsOptIn { .. } => {
@@ -806,7 +1207,18 @@ fn confirm(app: &mut PorchlyApp, dialog: &Dialog) -> bool {
         Dialog::DeleteRow { table, id } => {
             let ok = app.run("row.delete", json!({"table": table, "id": id})).is_some();
             app.reload_rows();
+            if ok {
+                app.info_with_undo(format!("Deleted row {id}."));
+            }
             ok
+        }
+        Dialog::DeleteRows { table, ids } => {
+            let Some(done) = app.run("row.delete_many", json!({"table": table, "ids": ids})) else { return false };
+            let n = done.get("deleted").and_then(|n| n.as_u64()).unwrap_or(0);
+            app.picked_rows.clear();
+            app.reload_rows();
+            app.info_with_undo(if n == 1 { "Deleted 1 row.".to_owned() } else { format!("Deleted {n} rows.") });
+            true
         }
         Dialog::DeleteTable { table } => {
             let ok = app.run("table.drop", json!({"name": table})).is_some();

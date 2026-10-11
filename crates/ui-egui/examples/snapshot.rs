@@ -2,7 +2,7 @@
 //!
 //! cargo run -p porchly-ui-egui --example snapshot -- out.png [--empty] [--share] [--dark]
 //!     [--fresh-key] [--dialog new_table|add_field|add_link|edit_field|new_key|delete_row] [--import file.csv]
-//!     [--sample recipes|orders] [--table name] [--size 1200x760] [--scale 2]
+//!     [--sample recipes|orders] [--table name] [--size 1200x760] [--scale 2] [--pick 2,3,5]
 //!     [--functions off|on|public] (with PORCHLY_TEST_BUN set, "on" also tries the function)
 //!     [--dialog functions|functions_progress|new_function|turn_off_functions|porch_light|settings]
 //!     [--porch-light] (with PORCHLY_TEST_CLOUDFLARED set: really turns it on, needs the internet)
@@ -83,7 +83,7 @@ fn main() {
         _ => {}
     }
     if live_light.is_some() {
-        app.start_porch_light(false);
+        app.start_porch_light(false, false);
     }
     if live_bun.is_some() && functions.as_deref() == Some("on") {
         app.refresh_status_now();
@@ -94,6 +94,10 @@ fn main() {
     }
     if let Some(file) = value("--import") {
         app.begin_import(std::path::Path::new(&file));
+    }
+    if let Some(ids) = value("--pick") {
+        let ids: Vec<i64> = ids.split(',').filter_map(|i| i.trim().parse().ok()).collect();
+        app.pick_rows(&ids);
     }
     if let Some(text) = value("--search") {
         app.set_search(&text);
@@ -124,6 +128,13 @@ fn main() {
         }
         Some("new_key") => app.open_dialog(Dialog::NewKey { name: "My website".into(), can_write: false }),
         Some("delete_row") => app.open_dialog(Dialog::DeleteRow { table: "recipes".into(), id: 3 }),
+        Some("delete_rows") => {
+            app.open_dialog(Dialog::DeleteRows { table: "orders".into(), ids: vec![2, 3, 5] });
+            // With --confirm: the rows are deleted and the notice offers Undo.
+            if has("--confirm") {
+                app.confirm_dialog();
+            }
+        }
         Some("functions") => app.open_dialog(Dialog::functions_opt_in()),
         Some("functions_progress") => {
             app.open_dialog(Dialog::FunctionsOptIn { progress: Some((14_200_000, 36_646_985)) })
@@ -136,7 +147,61 @@ fn main() {
             app.open_dialog(d);
         }
         Some("settings") => app.open_settings(),
-        Some("porch_light") => app.open_dialog(Dialog::PorchLight { allow_changes: false, public_functions: false }),
+        Some("stats") => app.open_stats(),
+        Some("stats_demo") => {
+            // Made-up numbers, to look at the window with a busy project.
+            let per_minute: Vec<u32> =
+                (0..60u32).map(|i| (((i * 37) % 23) + (i / 6) * 3) * u32::from(i % 11 != 0)).collect();
+            app.show_stats(json!({
+                    "seconds": 7_500,
+                    "requests": {"total": 12_940, "ok": 12_701, "refused": 37, "rate_limited": 4, "mistakes": 198,
+                                 "failed": 0, "reads": 11_820, "writes": 1_120, "public": 4_310, "mcp": 212},
+                    "per_minute": per_minute,
+                    "keys": [
+                        {"name": "Shop website", "requests": 9_412, "last_used_seconds_ago": 3},
+                        {"name": "Order app", "requests": 3_103, "last_used_seconds_ago": 95},
+                        {"name": "Claude", "requests": 212, "last_used_seconds_ago": 1_900},
+                    ],
+                    "tables": [
+                        {"name": "orders", "rows": 18_240, "requests": 8_870},
+                        {"name": "customers", "rows": 2_316, "requests": 3_655},
+                        {"name": "products", "rows": 148, "requests": 203},
+                    ],
+                    "functions": [{"name": "send_invoice", "calls": 86}, {"name": "stripe_hook", "calls": 12}],
+                    "project": {"tables": 3, "rows": 20_704, "size_bytes": 6_815_744, "keys": 3, "backups": 9,
+                                "backups_bytes": 41_943_040, "changes": 14},
+            }));
+        }
+        Some("connect_ai") => app.open_connect_ai(),
+        Some("backups") => {
+            // Some history to show (needs a project on disk: use --functions off).
+            app.run("row.update", json!({"table": "recipes", "id": 1, "values": {"minutes": 30}}));
+            app.run("row.delete_many", json!({"table": "recipes", "ids": [2, 3, 5]}));
+            app.run("undo.run", json!({}));
+            app.run("row.delete", json!({"table": "recipes", "id": 6}));
+            app.run("backup.create", json!({}));
+            app.run("table.create", json!({"name": "old_notes", "fields": [{"name": "text", "type": "text"}]}));
+            app.run("table.drop", json!({"name": "old_notes"}));
+            app.select_table("recipes");
+            app.open_backups();
+        }
+        Some("porch_light") => app.open_dialog(Dialog::PorchLight {
+            own: false,
+            has_token: false,
+            allow_changes: false,
+            public_functions: false,
+        }),
+        Some("porch_light_own") => app.open_dialog(Dialog::PorchLight {
+            own: true,
+            has_token: true,
+            allow_changes: false,
+            public_functions: false,
+        }),
+        Some("own_address") => app.open_dialog(Dialog::OwnAddress {
+            token: String::new(),
+            has_token: false,
+            service: "http://localhost:11920".into(),
+        }),
         Some("turn_off_functions") => app.open_dialog(Dialog::TurnOffFunctions { remove_runtime: false }),
         Some(other) => panic!("unknown dialog {other}"),
         None => {}

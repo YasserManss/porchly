@@ -15,6 +15,7 @@ enum Action {
     NewKey,
     Copy(String, &'static str),
     OpenDocs,
+    ConnectAi,
     DismissFreshKey,
     Light(porch_light::Action),
 }
@@ -151,9 +152,18 @@ fn keys_section(app: &PorchlyApp, ui: &mut Ui, t: &Tokens, actions: &mut Vec<Act
         ui.label(RichText::new(format!("{revoked} key(s) turned off.")).small().color(t.text_dim));
     }
     ui.add_space(6.0);
-    if icons::button(ui, Some(Icon::Plus), "New key", false).clicked() {
-        actions.push(Action::NewKey);
-    }
+    ui.horizontal_wrapped(|ui| {
+        if icons::button(ui, Some(Icon::Plus), "New key", false).clicked() {
+            actions.push(Action::NewKey);
+        }
+        // AI assistants use a key like any other app.
+        if icons::button(ui, None, "Connect an AI assistant\u{2026}", false)
+            .on_hover_text("Let Claude, Cursor or another assistant look things up in your tables, and change them if its key allows")
+            .clicked()
+        {
+            actions.push(Action::ConnectAi);
+        }
+    });
 }
 
 fn developers(app: &PorchlyApp, ui: &mut Ui, t: &Tokens, actions: &mut Vec<Action>) {
@@ -205,6 +215,7 @@ fn apply(app: &mut PorchlyApp, ctx: &egui::Context, actions: Vec<Action>) {
             }
             Action::DismissFreshKey => app.fresh_key = None,
             Action::OpenDocs => app.open_docs(ctx),
+            Action::ConnectAi => app.open_connect_ai(),
             Action::Light(a) => porch_light::apply(app, ctx, a),
         }
     }

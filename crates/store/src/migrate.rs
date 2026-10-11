@@ -7,7 +7,7 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::{DbResult, NOW};
 
 /// The newest project format this build reads and writes.
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
 
 const V1: &str = "
 CREATE TABLE _porchly_meta (
@@ -42,7 +42,26 @@ const V2: &str = "
 ALTER TABLE _porchly_fields ADD COLUMN links_to TEXT;
 ";
 
-const MIGRATIONS: &[(u32, &str)] = &[(1, V1), (2, V2)];
+/// Undo: what rows looked like before they were changed or deleted, grouped by change.
+const V3: &str = "
+CREATE TABLE _porchly_undo_ops (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    at        TEXT NOT NULL,
+    summary   TEXT NOT NULL,
+    undone_at TEXT
+);
+CREATE TABLE _porchly_undo_rows (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    op         INTEGER NOT NULL REFERENCES _porchly_undo_ops(id) ON DELETE CASCADE,
+    table_name TEXT NOT NULL,
+    row_id     INTEGER NOT NULL,
+    deleted    INTEGER NOT NULL,
+    old        TEXT NOT NULL
+);
+CREATE INDEX _porchly_undo_rows_op ON _porchly_undo_rows(op);
+";
+
+const MIGRATIONS: &[(u32, &str)] = &[(1, V1), (2, V2), (3, V3)];
 
 pub(crate) fn run(conn: &mut Connection) -> Result<()> {
     let current = current_version(conn)?;
@@ -65,7 +84,7 @@ pub(crate) fn run(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
-fn current_version(conn: &Connection) -> Result<u32> {
+pub(crate) fn current_version(conn: &Connection) -> Result<u32> {
     let has_meta: bool = conn
         .query_row("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = '_porchly_meta'", [], |r| {
             r.get::<_, i64>(0)

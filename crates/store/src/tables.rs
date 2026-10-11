@@ -130,6 +130,7 @@ impl Store {
         }
         self.snapshot(&format!("before-drop-table-{}", table.name))?;
         let tx = self.conn.transaction().db()?;
+        crate::undo::forget(&tx, table.name.as_str())?;
         tx.execute(&format!("DROP TABLE {}", table.name.quoted()), []).db()?;
         tx.execute("DELETE FROM _porchly_fields WHERE table_name = ?1", [table.name.as_str()]).db()?;
         tx.execute("DELETE FROM _porchly_tables WHERE name = ?1", [table.name.as_str()]).db()?;
@@ -154,6 +155,7 @@ impl Store {
             )));
         }
         let tx = self.conn.transaction().db()?;
+        crate::undo::forget(&tx, def.name.as_str())?;
         tx.execute(
             &format!("ALTER TABLE {} ADD COLUMN {} {}", def.name.quoted(), field.name.quoted(), field.kind.sql_type()),
             [],
@@ -188,6 +190,7 @@ impl Store {
         let is_link = f.kind == FieldKind::Link;
         self.snapshot(&format!("before-drop-field-{}-{}", def.name, fname))?;
         let tx = self.conn.transaction().db()?;
+        crate::undo::forget(&tx, def.name.as_str())?;
         if is_link {
             tx.execute(&format!("DROP INDEX IF EXISTS {}", link_index_name(&def.name, &fname)), []).db()?;
         }
@@ -277,6 +280,7 @@ impl Store {
         }
         let t = def.name.quoted();
         let tx = self.conn.transaction().db()?;
+        crate::undo::forget(&tx, def.name.as_str())?;
         if old.kind == FieldKind::Link {
             tx.execute(&format!("DROP INDEX IF EXISTS {}", link_index_name(&def.name, &old.name)), []).db()?;
         }
@@ -393,7 +397,7 @@ impl Store {
         Ok(n > 0)
     }
 
-    pub(crate) fn count_rows(&self, table: &TableDef) -> Result<u64> {
+    pub fn count_rows(&self, table: &TableDef) -> Result<u64> {
         let n: i64 =
             self.conn.query_row(&format!("SELECT count(*) FROM {}", table.name.quoted()), [], |r| r.get(0)).db()?;
         Ok(u64::try_from(n).unwrap_or(0))

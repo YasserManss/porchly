@@ -13,6 +13,7 @@ porchly-store.workspace = true
 porchly-api.workspace = true
 porchly-functions.workspace = true
 porchly-tunnel.workspace = true
+porchly-secrets.workspace = true
 getrandom.workspace = true
 data-encoding.workspace = true
 tokio.workspace = true

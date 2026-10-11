@@ -47,12 +47,19 @@ struct Running {
     child: Child,
     state: Arc<Mutex<State>>,
     started: Instant,
+    /// True when running the owner's own tunnel (a stable address) rather than a quick one.
+    own: bool,
+    local_port: u16,
 }
 
 #[derive(Debug, Default)]
 struct State {
     url: Option<String>,
     connected: bool,
+    /// With your own tunnel: the addresses Cloudflare sends here, as (address, where to).
+    routes: Vec<(String, String)>,
+    /// Whether Cloudflare has told us the tunnel's routes yet.
+    routes_known: bool,
     /// Why it stopped, once it has.
     ended: Option<String>,
     recent: VecDeque<String>,
@@ -110,8 +117,9 @@ impl PorchLight {
     }
 
     /// Starts the tunnel to `http://127.0.0.1:<local_port>`. Doesn't wait for the link; watch
-    /// [`PorchLight::status`].
-    pub fn start(&self, program: &Path, local_port: u16) -> Result<()> {
+    /// [`PorchLight::status`]. Without `token`, a free quick tunnel with a new address each
+    /// time. With the `token` of the owner's own Cloudflare tunnel, their stable address.
+    pub fn start(&self, program: &Path, local_port: u16, token: Option<&str>) -> Result<()> {
         let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(r) = running.as_mut()
             && r.alive()
@@ -124,13 +132,13 @@ impl PorchLight {
             .and_then(|()| std::fs::write(&config, CONFIG))
             .map_err(|e| porchly_fetch::write_error(&config, &e))?;
         let mut cmd = Command::new(program);
-        cmd.args(["tunnel", "--no-autoupdate", "--config"])
-            .arg(&config)
-            .args(["--metrics", "127.0.0.1:0", "--url"])
-            .arg(format!("http://127.0.0.1:{local_port}"))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
+        cmd.args(["tunnel", "--no-autoupdate", "--config"]).arg(&config).args(["--metrics", "127.0.0.1:0"]);
+        match token {
+            // In the environment, not on the command line, where other programs could read it.
+            Some(token) => cmd.arg("run").env("TUNNEL_TOKEN", token),
+            None => cmd.arg("--url").arg(format!("http://127.0.0.1:{local_port}")),
+        };
+        cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -141,13 +149,29 @@ impl PorchLight {
         let state = Arc::new(Mutex::new(State::default()));
         if let Some(err) = child.stderr.take() {
             let (state, log) = (state.clone(), self.log.clone());
+            let secret = token.map(str::to_owned);
             let spawned = std::thread::Builder::new().name("porchly-porch-light".into()).spawn(move || {
                 for line in BufReader::new(err).lines().map_while(std::result::Result::ok) {
+                    // The token must never reach the log or an error message.
+                    let line = match &secret {
+                        Some(t) if line.contains(t.as_str()) => line.replace(t.as_str(), "[token]"),
+                        _ => line,
+                    };
                     if let Some(log) = &log {
                         write_log(log, &line);
                     }
                     let mut s = state.lock().unwrap_or_else(PoisonError::into_inner);
-                    if s.url.is_none() {
+                    if secret.is_some() {
+                        if let Some(routes) = find_routes(&line) {
+                            s.routes = routes;
+                            s.routes_known = true;
+                        }
+                        // cloudflared keeps retrying a token Cloudflare refuses, forever:
+                        // say so instead of "connecting" without end.
+                        if !s.connected && token_refused(&line) {
+                            s.ended = Some(REFUSED.to_owned());
+                        }
+                    } else if s.url.is_none() {
                         s.url = find_url(&line);
                     }
                     if line.contains("Registered tunnel connection") {
@@ -159,8 +183,8 @@ impl PorchLight {
                     s.recent.push_back(line);
                 }
                 let mut s = state.lock().unwrap_or_else(PoisonError::into_inner);
-                let reason = explain_end(&s);
-                s.ended = Some(reason);
+                let reason = if secret.is_some() { explain_own_end(&s) } else { explain_end(&s) };
+                s.ended.get_or_insert(reason);
                 s.connected = false;
             });
             if let Err(e) = spawned {
@@ -168,7 +192,7 @@ impl PorchLight {
                 return Err(Error::Internal(format!("couldn't watch the porch light: {e}")));
             }
         }
-        *running = Some(Running { child, state, started: Instant::now() });
+        *running = Some(Running { child, state, started: Instant::now(), own: token.is_some(), local_port });
         Ok(())
     }
 
@@ -203,11 +227,27 @@ impl PorchLight {
                 let alive = r.alive();
                 let s = r.state.lock().unwrap_or_else(PoisonError::into_inner);
                 let elapsed = r.started.elapsed().as_secs();
-                match (&s.ended, alive, s.connected, &s.url) {
-                    (Some(reason), _, _, _) => json!({ "state": "failed", "error": reason }),
-                    (None, false, _, _) => json!({ "state": "failed", "error": explain_end(&s) }),
-                    (None, true, true, Some(url)) => json!({ "state": "on", "url": url }),
-                    (None, true, _, url) => json!({ "state": "connecting", "url": url, "slow": elapsed >= SLOW_SECS }),
+                if r.own {
+                    match (&s.ended, alive, s.connected) {
+                        (Some(reason), _, _) => json!({ "state": "failed", "error": reason, "own": true }),
+                        (None, false, _) => json!({ "state": "failed", "error": explain_own_end(&s), "own": true }),
+                        (None, true, true) => {
+                            let (url, problem) = own_address(&s, r.local_port);
+                            json!({ "state": "on", "own": true, "url": url, "problem": problem })
+                        }
+                        (None, true, false) => {
+                            json!({ "state": "connecting", "own": true, "slow": elapsed >= SLOW_SECS })
+                        }
+                    }
+                } else {
+                    match (&s.ended, alive, s.connected, &s.url) {
+                        (Some(reason), _, _, _) => json!({ "state": "failed", "error": reason }),
+                        (None, false, _, _) => json!({ "state": "failed", "error": explain_end(&s) }),
+                        (None, true, true, Some(url)) => json!({ "state": "on", "url": url }),
+                        (None, true, _, url) => {
+                            json!({ "state": "connecting", "url": url, "slow": elapsed >= SLOW_SECS })
+                        }
+                    }
                 }
             }
         };
@@ -241,6 +281,107 @@ fn find_url(line: &str) -> Option<String> {
         && host != "api.trycloudflare.com"
         && host.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.');
     ok.then(|| url.to_owned())
+}
+
+/// Reads the routes of the owner's tunnel from cloudflared's "Updated to new configuration"
+/// line: each public address and where Cloudflare sends its visitors.
+fn find_routes(line: &str) -> Option<Vec<(String, String)>> {
+    let start = line.find("config=\"")? + "config=\"".len();
+    let rest = line.get(start..)?;
+    // The JSON is quoted, with its own quotes escaped; it ends at the last quote on the line.
+    let end = rest.rfind('"')?;
+    let text = rest.get(..end)?.replace("\\\"", "\"");
+    let config: Value = serde_json::from_str(&text).ok()?;
+    let routes = config
+        .get("ingress")?
+        .as_array()?
+        .iter()
+        .filter_map(|rule| {
+            let host = rule.get("hostname")?.as_str()?;
+            let service = rule.get("service")?.as_str()?;
+            let ok = !host.is_empty()
+                && host.len() <= 253
+                && host.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '*');
+            ok.then(|| (host.to_owned(), service.chars().take(200).collect()))
+        })
+        .collect();
+    Some(routes)
+}
+
+/// Whether a tunnel route's destination is this computer on `port`.
+fn points_here(service: &str, port: u16) -> bool {
+    let rest = service.strip_prefix("http://").unwrap_or(service).trim_end_matches('/');
+    ["localhost", "127.0.0.1", "[::1]"].iter().any(|host| rest == format!("{host}:{port}"))
+}
+
+/// With the owner's own tunnel connected: its address, or what's wrong with how it's set up
+/// in Cloudflare. The address must lead to Porchly's public door (`port`), which keeps the
+/// link read-only unless changes are allowed; any other destination would skip that.
+fn own_address(s: &State, port: u16) -> (Option<String>, Option<String>) {
+    if !s.routes_known {
+        return (None, None);
+    }
+    if let Some((host, _)) = s.routes.iter().find(|(host, service)| !host.contains('*') && points_here(service, port)) {
+        return (Some(format!("https://{host}")), None);
+    }
+    let problem = match s.routes.first() {
+        Some((host, service)) => format!(
+            "Your Cloudflare tunnel sends {host} to {service}, not to Porchly's public door. In Cloudflare, set the service of that address to http://localhost:{port}."
+        ),
+        None => format!(
+            "Your Cloudflare tunnel has no public address yet. In Cloudflare, add a public hostname to the tunnel and set its service to http://localhost:{port}."
+        ),
+    };
+    (None, Some(problem))
+}
+
+const REFUSED: &str = "Cloudflare didn't accept the token. The tunnel may have been deleted, or the token copied incompletely. Copy it again from your tunnel's page in Cloudflare and paste it into Porchly.";
+
+/// Whether a line of cloudflared's output says Cloudflare refused the tunnel's token.
+/// (Seen with cloudflared 2026.10: `ERR Register tunnel error from server side
+/// error="Failed to get tunnel"`, repeated while it retries.)
+fn token_refused(line: &str) -> bool {
+    let l = line.to_ascii_lowercase();
+    l.contains("token is not valid")
+        || l.contains("invalid tunnel secret")
+        || (l.contains("register tunnel error") && (l.contains("failed to get tunnel") || l.contains("unauthorized")))
+}
+
+/// Why the owner's own tunnel stopped, in plain words.
+fn explain_own_end(s: &State) -> String {
+    if s.recent.iter().any(|l| token_refused(l)) {
+        REFUSED.into()
+    } else if !s.connected {
+        "Couldn't reach Cloudflare. Check that this computer is connected to the internet. Some networks (offices, hotels, schools) block this kind of link."
+            .into()
+    } else {
+        "The public link stopped. Turn the porch light on again; if it keeps stopping, the log has details.".into()
+    }
+}
+
+/// Finds a Cloudflare tunnel token in what someone pasted: the token itself, or the whole
+/// command Cloudflare shows (`cloudflared service install eyJh…`). A token is base64 of a
+/// small JSON object naming the account (`a`), the tunnel (`t`) and its secret (`s`).
+pub fn clean_token(pasted: &str) -> Result<String> {
+    let looks_right = |piece: &str| {
+        let unpadded = piece.trim_end_matches('=');
+        data_encoding::BASE64_NOPAD
+            .decode(unpadded.as_bytes())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .is_some_and(|v| ["a", "t", "s"].iter().all(|k| v.get(k).is_some_and(Value::is_string)))
+    };
+    pasted
+        .split(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+        .filter(|piece| (40..=2000).contains(&piece.len()))
+        .rev()
+        .find(|piece| looks_right(piece))
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            Error::invalid(
+                "That doesn't look like a Cloudflare tunnel token. In Cloudflare, open your tunnel, copy the token (a long line starting with eyJ), and paste it here.",
+            )
+        })
 }
 
 /// A plain-language reason the tunnel stopped, from what cloudflared said last.
@@ -296,7 +437,7 @@ mod tests {
         let light = PorchLight::new(None);
         assert_eq!(light.status()["state"], "off");
         assert!(light.ensure_program(true).is_err() || runtime::chosen_by_environment());
-        assert!(light.start(Path::new("/nonexistent"), 1).is_err());
+        assert!(light.start(Path::new("/nonexistent"), 1, None).is_err());
     }
 
     #[test]
@@ -312,7 +453,7 @@ mod tests {
         if !program.is_file() {
             return;
         }
-        light.start(&program, 1).unwrap();
+        light.start(&program, 1, None).unwrap();
         for _ in 0..50 {
             if light.status()["state"] == "failed" {
                 break;
@@ -325,5 +466,123 @@ mod tests {
         assert!(dir.path().join("tools/porchly-cloudflared.yml").is_file());
         light.stop();
         assert_eq!(light.status()["state"], "off");
+    }
+
+    /// A token shaped like Cloudflare's (base64 of {"a","t","s"}), made up for tests.
+    fn fake_token() -> String {
+        data_encoding::BASE64.encode(br#"{"a":"0123456789abcdef0123456789abcdef","t":"11111111-2222-3333-4444-555555555555","s":"c2VjcmV0LXNlY3JldC1zZWNyZXQ="}"#)
+    }
+
+    #[test]
+    fn tokens_are_found_in_what_people_paste() {
+        let token = fake_token();
+        assert_eq!(clean_token(&token).unwrap(), token);
+        assert_eq!(clean_token(&format!("  {token}\n")).unwrap(), token);
+        let command = format!("sudo cloudflared service install {token}");
+        assert_eq!(clean_token(&command).unwrap(), token, "the whole command Cloudflare shows");
+        assert_eq!(clean_token(&format!("cloudflared.exe tunnel run --token \"{token}\"")).unwrap(), token);
+        for wrong in
+            ["", "hello", "eyJhIjoiYiJ9", "pk_abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz", &"A".repeat(200)]
+        {
+            let err = clean_token(wrong).unwrap_err().to_string();
+            assert!(err.contains("doesn't look like a Cloudflare tunnel token"), "{wrong:?}: {err}");
+        }
+    }
+
+    const CONFIG_LINE: &str = r#"2026-10-11T08:00:01Z INF Updated to new configuration config="{\"ingress\":[{\"hostname\":\"api.example.com\",\"originRequest\":{},\"service\":\"http://localhost:11920\"},{\"originRequest\":{},\"service\":\"http_status:404\"}],\"warp-routing\":{\"enabled\":false}}" version=3"#;
+
+    #[test]
+    fn reads_the_address_from_the_tunnel_s_routes() {
+        let routes = find_routes(CONFIG_LINE).unwrap();
+        assert_eq!(routes, [("api.example.com".to_owned(), "http://localhost:11920".to_owned())]);
+        assert!(find_routes("INF Registered tunnel connection").is_none());
+        assert!(find_routes(r#"INF Updated to new configuration config="not json" version=1"#).is_none());
+
+        assert!(points_here("http://localhost:11920", 11920) && points_here("http://127.0.0.1:11920/", 11920));
+        assert!(!points_here("http://localhost:11911", 11920) && !points_here("http://192.168.1.5:11920", 11920));
+        assert!(!points_here("https://localhost:11920", 11920) && !points_here("http://localhost:119200", 11920));
+
+        let mut s = State { routes, routes_known: true, ..State::default() };
+        assert_eq!(own_address(&s, 11920), (Some("https://api.example.com".to_owned()), None));
+        // Pointing the address at the main API would skip the read-only public door: say so.
+        let (url, problem) = own_address(&s, 11921);
+        assert!(
+            url.is_none() && problem.unwrap().contains("set the service of that address to http://localhost:11921")
+        );
+        s.routes.clear();
+        assert!(own_address(&s, 11920).1.unwrap().contains("no public address yet"));
+        assert_eq!(own_address(&State::default(), 11920), (None, None), "not told yet");
+    }
+
+    /// A stand-in for cloudflared with a token: says what the real one says, then keeps running.
+    #[cfg(unix)]
+    fn fake_cloudflared(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("fake-cloudflared");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn wait_for(light: &PorchLight, state: &str) -> Value {
+        for _ in 0..200 {
+            let status = light.status();
+            if status["state"] == state {
+                return status;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!("never reached {state}: {}", light.status());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn your_own_tunnel_gives_a_stable_address_and_the_token_stays_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let light = PorchLight::new(Some(dir.path()));
+        let token = fake_token();
+        let script = format!(
+            "echo \"INF Starting tunnel with token $TUNNEL_TOKEN args: $*\" >&2\n\
+             echo '{}' >&2\n\
+             echo 'INF Registered tunnel connection connIndex=0' >&2\n\
+             sleep 30",
+            CONFIG_LINE.replace('\'', "")
+        );
+        let program = fake_cloudflared(dir.path(), &script);
+        light.start(&program, 11920, Some(&token)).unwrap();
+        let status = wait_for(&light, "on");
+        assert_eq!(status["url"], "https://api.example.com");
+        assert_eq!((status["own"].as_bool(), status["problem"].is_null()), (Some(true), true));
+        let log = std::fs::read_to_string(dir.path().join("logs/porch-light.log")).unwrap();
+        assert!(log.contains("with token [token]"), "the program got the token: {log}");
+        assert!(!log.contains(&token), "and it never reaches the log");
+        assert!(log.contains("args: tunnel --no-autoupdate") && log.contains(" run"), "{log}");
+        assert!(!log.contains("--url"), "your own tunnel's routes come from Cloudflare");
+        assert!(!format!("{status}").contains(&token));
+        light.stop();
+        assert_eq!(light.status()["state"], "off");
+
+        // Set up to send visitors somewhere else: on, but with a clear problem and no address.
+        light.start(&program, 12345, Some(&token)).unwrap();
+        let status = wait_for(&light, "on");
+        assert!(status["url"].is_null());
+        assert!(status["problem"].as_str().unwrap().contains("http://localhost:12345"));
+        light.stop();
+
+        // A token Cloudflare refuses: the real program keeps retrying and never exits.
+        let refused = fake_cloudflared(
+            dir.path(),
+            "echo 'ERR Register tunnel error from server side error=\"Failed to get tunnel\" connIndex=0' >&2\nsleep 30",
+        );
+        light.start(&refused, 11920, Some(&token)).unwrap();
+        let status = wait_for(&light, "failed");
+        assert!(status["error"].as_str().unwrap().contains("didn't accept the token"), "{status}");
+        light.stop();
+        assert!(token_refused("ERR Provided Tunnel token is not valid."));
+        assert!(
+            !token_refused("ERR Failed to fetch features, default to disable"),
+            "an ordinary hiccup isn't a refusal"
+        );
     }
 }

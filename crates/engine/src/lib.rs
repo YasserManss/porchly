@@ -31,6 +31,19 @@ pub struct Engine {
 pub(crate) struct Light {
     pub tunnel: PorchLight,
     pub allow_changes: Arc<std::sync::atomic::AtomicBool>,
+    /// Where the token of the owner's own tunnel is kept: the system keychain, found on
+    /// first use (or memory, for previews and tests).
+    secrets: std::sync::OnceLock<Arc<dyn porchly_secrets::Secrets>>,
+    /// Never touch the real keychain (previews and tests).
+    memory_only: bool,
+}
+
+impl Light {
+    pub(crate) fn secrets(&self) -> &Arc<dyn porchly_secrets::Secrets> {
+        self.secrets.get_or_init(|| {
+            if self.memory_only { Arc::new(porchly_secrets::Memory::default()) } else { porchly_secrets::system() }
+        })
+    }
 }
 
 /// What a command can reach. The project is locked only when a command first asks for it,
@@ -62,7 +75,7 @@ impl<'a> Ctx<'a> {
         self.functions
     }
 
-    pub(crate) fn light(&self) -> &Light {
+    pub(crate) fn light(&self) -> &'a Light {
         self.light
     }
 
@@ -89,22 +102,31 @@ impl Engine {
 
     fn with_net(store: Shared, allowed: bool) -> Self {
         let functions = Arc::new(functions_service(&store));
-        let light = Arc::new(light_for(&store));
+        let light = Arc::new(light_for(&store, !allowed));
         let net = Arc::new(Net::new(allowed));
         cmd::apply_settings(&lock(&store), &net, &functions);
-        Engine { store, net, functions, light }
+        let engine = Engine { store, net, functions, light };
+        // Today's backup, if there isn't one yet. Opening a project must never fail over it.
+        let _ = engine.execute("backup.daily", &Value::Null);
+        engine
     }
 
     /// What the API serves besides the tables (functions and their internal key), for
     /// servers started outside the engine (`porchly-cli serve`). Tell the engine the
     /// server's address with [`Engine::api_started`].
     pub fn api_options(&self) -> porchly_api::Options {
-        cmd::api_options(&self.functions, self.net.limits())
+        cmd::api_options(&self.functions, self.net.limits(), self.net.stats())
     }
 
     /// Runs functions with this Bun program instead of Porchly's own copy (tests, `--bun`).
     pub fn use_bun(&self, path: Option<std::path::PathBuf>) {
         self.functions.use_bun(path);
+    }
+
+    /// Keeps secrets in memory instead of the system keychain (tests). Call before any
+    /// command that uses a secret.
+    pub fn use_memory_secrets(&self) {
+        let _ = self.light.secrets.set(Arc::new(porchly_secrets::Memory::default()));
     }
 
     /// Uses this cloudflared instead of Porchly's own copy (tests).
@@ -159,11 +181,16 @@ fn functions_service(store: &Shared) -> Service {
 
 /// The porch light for the project in `store`. Always off at start; whether changes are
 /// allowed through it is remembered.
-fn light_for(store: &Shared) -> Light {
+fn light_for(store: &Shared, memory_only: bool) -> Light {
     let s = lock(store);
     let dir = s.path().and_then(Path::parent);
     let allow = s.setting(cmd::PORCH_LIGHT_CHANGES).ok().flatten().as_deref() == Some("on");
-    Light { tunnel: PorchLight::new(dir), allow_changes: Arc::new(std::sync::atomic::AtomicBool::new(allow)) }
+    Light {
+        tunnel: PorchLight::new(dir),
+        allow_changes: Arc::new(std::sync::atomic::AtomicBool::new(allow)),
+        secrets: std::sync::OnceLock::new(),
+        memory_only,
+    }
 }
 
 #[cfg(test)]
@@ -342,6 +369,9 @@ mod tests {
         let s = e.execute("settings.get", &json!({})).unwrap();
         assert_eq!((s["requests_per_second"].as_u64(), s["function_timeout"].as_u64()), (Some(20), Some(0)));
         assert_eq!((s["port"].as_u64(), s["start_api"].as_bool()), (Some(11911), Some(true)));
+        assert_eq!(s["ai_can_make_tables"], false, "off unless the owner says so");
+        e.execute("settings.set", &json!({"ai_can_make_tables": true})).unwrap();
+        assert_eq!(e.execute("settings.get", &json!({})).unwrap()["ai_can_make_tables"], true);
         assert_eq!(e.net.limits().per_second(), 20);
 
         e.execute("settings.set", &json!({"requests_per_second": 100, "function_timeout": 30})).unwrap();
@@ -376,6 +406,125 @@ mod tests {
         assert_eq!((s["port"].as_u64(), s["start_api"].as_bool()), (Some(u64::from(free)), Some(false)));
         assert_eq!(e.net.limits().per_second(), 100);
         assert_eq!(e.functions.timeout(), Some(std::time::Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn bulk_row_commands() {
+        let (_dir, e) = engine();
+        e.execute("sample.load", &json!({"name": "orders"})).unwrap();
+        let added = e
+            .execute(
+                "row.insert_many",
+                &json!({"table": "orders", "rows": [{"item": "Tea"}, {"item": "Jam", "quantity": 2}]}),
+            )
+            .unwrap();
+        assert_eq!((added["count"].as_u64(), added["items"][1]["item"].as_str()), (Some(2), Some("Jam")));
+        assert!(
+            e.execute("row.insert_many", &json!({"table": "orders", "rows": [{"item": "Ok"}, {"quantity": 1}]}))
+                .is_err()
+        );
+        assert!(e.execute("row.insert_many", &json!({"table": "orders", "rows": [5]})).is_err());
+        assert_eq!(e.execute("row.list", &json!({"table": "orders"})).unwrap()["total"], 11);
+
+        let done = e
+            .execute("row.update_many", &json!({"table": "orders", "ids": [1, 2, 3], "values": {"delivered": true}}))
+            .unwrap();
+        assert_eq!(done["updated"], 3);
+        let done = e
+            .execute(
+                "row.update_many",
+                &json!({"table": "orders", "where": {"customer.city": "Berlin"}, "values": {"quantity": 7}}),
+            )
+            .unwrap();
+        assert_eq!(done["updated"], 3);
+
+        // No rows named: an error, and nothing happens.
+        for params in [
+            json!({"table": "orders"}),
+            json!({"table": "orders", "ids": []}),
+            json!({"table": "orders", "ids": ["x"]}),
+        ] {
+            assert!(e.execute("row.delete_many", &params).is_err(), "{params}");
+        }
+        assert!(e.execute("row.update_many", &json!({"table": "orders", "values": {"quantity": 0}})).is_err());
+        assert_eq!(e.execute("row.list", &json!({"table": "orders"})).unwrap()["total"], 11);
+
+        let gone = e.execute("row.delete_many", &json!({"table": "orders", "ids": [10, 11, 99]})).unwrap();
+        assert_eq!(gone["deleted"], 2);
+        let gone = e.execute("row.delete_many", &json!({"table": "orders", "where": {"quantity": 7}})).unwrap();
+        assert_eq!(gone["deleted"], 3);
+        assert_eq!(e.execute("row.list", &json!({"table": "orders"})).unwrap()["total"], 6);
+    }
+
+    #[test]
+    fn undo_and_backups_through_commands() {
+        let (dir, e) = engine();
+        e.execute("sample.load", &json!({"name": "orders"})).unwrap();
+        assert!(dir.path().join("backups").is_dir(), "today's backup was made when the project opened");
+        assert_eq!(e.execute("backup.daily", &json!({})).unwrap()["made"], false, "once a day");
+
+        // Undo a bulk delete, then a single change, by default the newest first.
+        e.execute("row.delete_many", &json!({"table": "customers", "where": {"city": "Lisbon"}})).unwrap();
+        e.execute("row.update", &json!({"table": "orders", "id": 2, "values": {"item": "Changed"}})).unwrap();
+        let list = e.execute("undo.list", &json!({})).unwrap();
+        assert_eq!(list[0]["summary"], "Changed row 2 in orders");
+        assert_eq!(list[1]["summary"], "Deleted 2 rows from customers");
+        assert_eq!(e.execute("undo.run", &json!({})).unwrap()["reverted"], 1);
+        assert_eq!(e.execute("undo.run", &json!({})).unwrap()["restored"], 2);
+        let page = e.execute("row.list", &json!({"table": "orders", "where": {"customer.city": "Lisbon"}})).unwrap();
+        assert_eq!(page["total"], 3, "customers and the links to them are back");
+        assert!(e.execute("undo.run", &json!({})).is_err(), "nothing left to undo");
+
+        // Back up now (with a function's code), wreck things, restore.
+        let code = dir.path().join("functions/hello/main.ts");
+        std::fs::create_dir_all(code.parent().unwrap()).unwrap();
+        std::fs::write(&code, "// version 1").unwrap();
+        let name = e.execute("backup.create", &json!({})).unwrap()["name"].as_str().unwrap().to_owned();
+        std::fs::write(&code, "// version 2, a mistake").unwrap();
+        e.execute("field.drop", &json!({"table": "orders", "name": "customer"})).unwrap();
+        e.execute("table.drop", &json!({"name": "customers"})).unwrap();
+        let points = e.execute("backup.list", &json!({})).unwrap();
+        assert!(points.as_array().unwrap().iter().any(|p| p["label"] == "Backup made by hand"));
+        let done = e.execute("backup.restore", &json!({"name": name})).unwrap();
+        assert!(done["saved_as"].as_str().unwrap().ends_with("before-restore.db"));
+        assert_eq!(e.execute("row.list", &json!({"table": "customers"})).unwrap()["total"], 5);
+        assert_eq!(std::fs::read_to_string(&code).unwrap(), "// version 1", "the function's code is back too");
+        // Restoring the "before" state brings the mistake back: a restore can be reversed.
+        e.execute("backup.restore", &json!({"name": done["saved_as"]})).unwrap();
+        assert_eq!(std::fs::read_to_string(&code).unwrap(), "// version 2, a mistake");
+        assert!(e.execute("row.list", &json!({"table": "customers"})).is_err());
+        assert!(e.execute("backup.restore", &json!({"name": "../../etc/passwd"})).is_err());
+        assert!(e.execute("backup.restore", &json!({})).is_err());
+    }
+
+    #[test]
+    fn stats_count_what_happens() {
+        let (_dir, e) = engine();
+        e.execute("sample.load", &json!({"name": "orders"})).unwrap();
+        let secret =
+            e.execute("api.key.create", &json!({"name": "shop site"})).unwrap()["secret"].as_str().unwrap().to_owned();
+        let before = e.execute("stats.get", &json!({})).unwrap();
+        assert_eq!(before["requests"]["total"], 0);
+        assert_eq!((before["project"]["tables"].as_u64(), before["project"]["rows"].as_u64()), (Some(2), Some(14)));
+        assert!(before["project"]["size_bytes"].as_u64().unwrap() > 0);
+        assert_eq!(before["project"]["keys"], 1);
+        assert_eq!(before["project"]["backups"], 1, "today's");
+
+        let port = e.execute("api.start", &json!({})).unwrap()["port"].as_u64().unwrap() as u16;
+        for _ in 0..3 {
+            assert!(http_get(port, "/api/orders?limit=1", &secret).contains("\"total\""));
+        }
+        http_get(port, "/api/customers", &secret);
+        http_get(port, "/api/orders", "pk_wrong");
+        let s = e.execute("stats.get", &json!({})).unwrap();
+        assert_eq!((s["requests"]["total"].as_u64(), s["requests"]["refused"].as_u64()), (Some(5), Some(1)));
+        assert_eq!((s["keys"][0]["name"].as_str(), s["keys"][0]["requests"].as_u64()), (Some("shop site"), Some(4)));
+        let orders = s["tables"].as_array().unwrap().iter().find(|t| t["name"] == "orders").unwrap();
+        assert_eq!((orders["rows"].as_u64(), orders["requests"].as_u64()), (Some(9), Some(3)));
+        assert_eq!(s["per_minute"].as_array().unwrap().iter().filter_map(Value::as_u64).sum::<u64>(), 5);
+        // Turning the API off and on again doesn't lose the count.
+        e.execute("api.stop", &json!({})).unwrap();
+        assert_eq!(e.execute("stats.get", &json!({})).unwrap()["requests"]["total"], 5);
     }
 
     #[test]
@@ -436,7 +585,7 @@ mod tests {
         let shared = store.into_shared();
         let net = Net::new(false);
         let functions = Arc::new(functions_service(&shared));
-        let light = light_for(&shared);
+        let light = light_for(&shared, true);
         for c in registry() {
             for params in &hostile {
                 let mut cx = Ctx { shared: &shared, guard: None, net: &net, functions: &functions, light: &light };
